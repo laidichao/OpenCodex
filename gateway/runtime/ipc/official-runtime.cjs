@@ -2425,7 +2425,10 @@ function buildGatewayStatus() {
         abnormalCount: abnormalPoints.length,
         abnormalPoints,
         // 浏览器认证前尚未上报属于待检查，保留状态与数量，但仅明确异常影响健康结果。
-        ok: abnormalPoints.length === 0,
+        // [OCX-FORK] "unsupported" 不是故障：官方新版布局不支持该优化点时已自动回退官方原始行为
+        // （如 macOS-only 的 Push 注册优化在 Windows 上本就无用），不能把这类纯降级
+        // 报成健康异常，否则官方 Codex 一升级顶栏就常驻「健康异常」误报。
+        ok: abnormalPoints.every((point) => point.issues.every((issue) => issue.type === "unsupported")),
       };
     }
   } catch {

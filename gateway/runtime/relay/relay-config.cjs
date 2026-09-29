@@ -24,9 +24,17 @@ function readRelayConfig() {
   const url = String(process.env.OCX_RELAY_URL || "").trim();
   const secret = String(process.env.OCX_RELAY_SECRET || "").trim();
   const deviceName = String(
-    process.env.OCX_DEVICE_NAME || process.env.COMPUTERNAME || process.env.HOSTNAME || "device"
+    process.env.OCX_RELAY_DEVICE_NAME ||
+      process.env.OCX_DEVICE_NAME ||
+      process.env.COMPUTERNAME ||
+      process.env.HOSTNAME ||
+      "device"
   ).trim();
-  const deviceId = String(process.env.OCX_DEVICE_ID || crypto.randomBytes(8).toString("hex")).trim();
+  // launcher 注入的是 OCX_RELAY_DEVICE_ID（与 OCX_RELAY_* 前缀保持一致）；
+  // 旧名 OCX_DEVICE_ID 仅作兼容。都缺失时才退回随机 ID。
+  const deviceId = String(
+    process.env.OCX_RELAY_DEVICE_ID || process.env.OCX_DEVICE_ID || crypto.randomBytes(8).toString("hex")
+  ).trim();
   let localPort = 3737;
   try {
     localPort = Number(require("../core/config.cjs").PORT) || 3737;
