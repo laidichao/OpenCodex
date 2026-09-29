@@ -129,6 +129,28 @@ OpenCodex本身不提供远程访问服务，如果需要在其他设备中远�
 
 > 也可以使用公网，但不建议把 OpenCodex 直接暴露到公网，还是推荐上述工具，更加安全可控
 
+<!-- [OCX-FORK] BEGIN 服务器中继（反向隧道）部署说明：本 fork 新增能力，整块新增便于合并 upstream。 -->
+### 服务器中继部署（多设备统一入口）
+
+除了上述组网方案，本 fork 内置了**服务器中继**模式：在一台有公网 IP 的 VPS 上部署代理服务（openCodeProxy），各设备的 OpenCodex 启动器切到「服务器」模式后**主动出站反连** VPS——
+
+- **PC 端零入站端口、零公网暴露**：不需要 frp/内网穿透客户端，NAT/防火墙默认放行出站连接。
+- **一个 VPS 地址管理多台设备**：浏览器访问 `https://<VPS>:8443/d/<设备ID>/` 直接进入对应设备的 Codex 页面；VPS 看板支持账号密码登录（首次登录强制改密、密钥加密存储）。
+- **支持自定义访问后缀**：在启动器里把难记的设备 ID 换成自定义后缀（如 `/d/lai-pc/`），保存前强制要求已设置访问密码。
+
+**VPS 侧部署**（Node.js 单文件 + `ws` 依赖，无需数据库）：
+
+```bash
+# 最简试跑（生产部署见文档：TLS 证书 + systemd 常驻）
+mkdir -p /opt/proxy && cp proxy/server.js proxy/package.json /opt/proxy/
+cd /opt/proxy && npm install --omit=dev && node server.js
+```
+
+👉 **完整部署文档见 [proxy/README.md](proxy/README.md)**（含 VPS 环境准备、TLS 证书、systemd 常驻、看板账号与设备密钥管理、安全清单）。
+
+PC 侧无需任何额外工具：桌面启动器 → 启动地址选「服务器」→ 填 VPS 地址与设备密钥（看板「添加设备」生成）→ 保存即可。
+<!-- [OCX-FORK] END 服务器中继部署说明 -->
+
 ## 常用环境变量
 
 | 变量 | 默认值 | 说明 |
