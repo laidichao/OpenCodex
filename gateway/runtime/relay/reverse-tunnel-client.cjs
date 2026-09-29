@@ -133,14 +133,18 @@ function startReverseTunnel({ diagnosticLog = () => {}, diagnosticWarn = () => {
     stream.localWs = localWs;
     localWs.on("open", () => {
       stream.opened = true;
-      for (const chunk of stream.pending) {
+      for (const p of stream.pending) {
         try {
-          localWs.send(chunk);
+          localWs.send(p.buf, { binary: !!p.bin });
         } catch {}
       }
       stream.pending = [];
     });
-    localWs.on("message", (data) => send({ t: "data", id: msg.id, chunk: b64(data) }));
+    localWs.on("message", (data, isBinary) => {
+      // 保留 WS 帧类型：文本帧必须回传文本帧（浏览器端 JSON.parse(event.data) 依赖 string），
+      // 否则官方 UI 收到 Blob/ArrayBuffer 直接解析失败——工作区/主题等实时数据全挂。
+      send({ t: "data", id: msg.id, chunk: b64(data), bin: !!isBinary });
+    });
     localWs.on("close", (code) => {
       send({ t: "ws-close", id: msg.id, code: code || 1000 });
       streams.delete(msg.id);
@@ -161,12 +165,13 @@ function startReverseTunnel({ diagnosticLog = () => {}, diagnosticWarn = () => {
         s.req.write(buf);
       } catch {}
     } else if (s.role === "ws") {
+      // 去程同样保留帧类型：浏览器发来的文本帧必须以文本帧交给本地 gateway。
       if (s.opened && s.localWs && s.localWs.readyState === WebSocket.OPEN) {
         try {
-          s.localWs.send(buf);
+          s.localWs.send(buf, { binary: !!msg.bin });
         } catch {}
       } else {
-        s.pending.push(buf);
+        s.pending.push({ buf, bin: !!msg.bin });
       }
     }
   }
@@ -207,12 +212,14 @@ function startReverseTunnel({ diagnosticLog = () => {}, diagnosticWarn = () => {
     const sep = cfg.url.includes("?") ? "&" : "?";
     const auth = `${sep}device=${encodeURIComponent(cfg.deviceId)}&secret=${encodeURIComponent(cfg.secret)}`;
     let target = cfg.url;
-    // 允许 env 里只写 wss://host:port 不带路径；统一挂到 /agent
-    if (!/\/(agent|tunnel)\b/.test(target)) target = target.replace(/\/?$/, "/agent");
+    // 允许 env 里只写 wss://host:port 不带路径；统一挂到 /openCodeProxy
+    if (!/\/openCodeProxy\b/.test(target)) target = target.replace(/\/?$/, "/openCodeProxy");
     const fullUrl = target + auth;
     diagnosticLog("relay", "connecting", { url: target, deviceId: cfg.deviceId });
+    const wsOpts = {};
+    if (process.env.OCX_RELAY_TLS_INSECURE === "1") wsOpts.rejectUnauthorized = false;
     try {
-      ws = new WebSocket(fullUrl);
+      ws = new WebSocket(fullUrl, wsOpts);
     } catch (e) {
       diagnosticWarn("relay", "connect_failed", { error: String(e) });
       scheduleReconnect();
@@ -266,7 +273,13 @@ function startReverseTunnel({ diagnosticLog = () => {}, diagnosticWarn = () => {
       }
     });
     ws.on("close", () => onClose());
-    ws.on("error", () => {
+    ws.on("error", (e) => {
+      // 必须记录：TLS 证书校验失败/握手被拒都会只触发 error + close，
+      // 不打日志的话只能看到 connecting -> disconnected，无从定位。
+      diagnosticWarn("relay", "socket_error", {
+        error: String((e && e.message) || e),
+        tlsInsecure: process.env.OCX_RELAY_TLS_INSECURE === "1",
+      });
       try {
         ws.close();
       } catch {}
