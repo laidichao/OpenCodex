@@ -1,0 +1,312 @@
+// reverse-tunnel-client.cjs
+// OpenCodex 内嵌的反向隧道客户端：启动后主动出站连 VPS RelayServer（WebSocket），
+// 把本机 gateway 的整个 HTTP+WS 能力反推到 VPS。这样 PC 端无需任何独立穿透工具（frpc 等），
+// 也不需要在 PC 侧开任何入站端口——连接方向是出站，绝大多数 NAT/防火墙默认放行。
+//
+// 多路复用协议（控制 WS 上的 JSON 帧）：
+//   register / register-ok / register-reject
+//   open{id,method,path,headers}            -> VPS 新 HTTP 流（浏览器请求到达）
+//   ws-open{id,path,headers}                -> VPS 新 WebSocket 流（浏览器 /ws 升级）
+//   head{id,status,headers}                 -> PC 回复 HTTP 响应头
+//   data{id,chunk(base64)}                  -> 任意方向的正文/消息字节
+//   end{id}                                 -> HTTP 流结束
+//   ws-close{id,code}                       -> WebSocket 关闭
+//   ping / pong                             -> 心跳
+const WebSocket = require("ws");
+const http = require("http");
+const crypto = require("crypto");
+const { readRelayConfig } = require("./relay-config.cjs");
+
+const b64 = (buf) => Buffer.from(buf).toString("base64");
+const unb64 = (s) => Buffer.from(s, "base64");
+
+function resHeaders(res) {
+  const out = {};
+  for (const [k, v] of Object.entries(res.headers || {})) out[k] = v;
+  return out;
+}
+
+function startReverseTunnel({ diagnosticLog = () => {}, diagnosticWarn = () => {} } = {}) {
+  const cfg = readRelayConfig();
+  if (!cfg.enabled || !cfg.url) {
+    diagnosticLog("relay", "disabled", { reason: !cfg.enabled ? "OCX_RELAY_ENABLED!=1" : "OCX_RELAY_URL empty" });
+    return { started: false, reason: "disabled" };
+  }
+
+  let ws = null;
+  let closedByServer = false;
+  let reconnectDelay = 1000;
+  const MAX_DELAY = 30_000;
+  const streams = new Map(); // id -> { role:'http'|'ws', req?, localWs? }
+  let localToken = "";
+  let pingTimer = null;
+
+  const send = (obj) => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify(obj));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  };
+
+  const genId = () => crypto.randomBytes(8).toString("hex");
+
+  function ensureLocalToken() {
+    return new Promise((resolve) => {
+      if (!cfg.authPasswordHash) return resolve(""); // 无密码模式：本地 /ws 无需 token
+      const body = JSON.stringify({ passwordHash: cfg.authPasswordHash });
+      const req = http.request(
+        {
+          host: cfg.localHost,
+          port: cfg.localPort,
+          path: "/api/auth/login",
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+        },
+        (res) => {
+          let d = "";
+          res.on("data", (c) => (d += c));
+          res.on("end", () => {
+            try {
+              const j = JSON.parse(d);
+              resolve(j.token || "");
+            } catch {
+              resolve("");
+            }
+          });
+        }
+      );
+      req.on("error", () => resolve(""));
+      req.write(body);
+      req.end();
+    });
+  }
+
+  function openHttpStream(msg) {
+    const headers = Object.assign({}, msg.headers || {});
+    if (localToken) headers["x-codex-web-token"] = localToken;
+    let req;
+    try {
+      req = http.request(
+        {
+          host: cfg.localHost,
+          port: cfg.localPort,
+          method: msg.method || "GET",
+          path: msg.path || "/",
+          headers,
+        },
+        (res) => {
+          send({ t: "head", id: msg.id, status: res.statusCode, headers: resHeaders(res) });
+          res.on("data", (c) => send({ t: "data", id: msg.id, chunk: b64(c) }));
+          res.on("end", () => send({ t: "end", id: msg.id }));
+        }
+      );
+    } catch (e) {
+      send({ t: "head", id: msg.id, status: 502, headers: { "content-type": "text/plain" }, error: String(e) });
+      return;
+    }
+    req.on("error", (e) => {
+      send({ t: "head", id: msg.id, status: 502, headers: { "content-type": "text/plain" }, error: String(e) });
+      send({ t: "end", id: msg.id });
+    });
+    req.setTimeout(120_000, () => req.destroy());
+    streams.set(msg.id, { role: "http", req });
+  }
+
+  function openWsStream(msg) {
+    const url = `ws://${cfg.localHost}:${cfg.localPort}/ws${localToken ? `?token=${encodeURIComponent(localToken)}` : ""}`;
+    // 浏览器可能在 PC 本地 WS 尚未连上时就把首帧发过来，这里先登记流并缓冲，待本地 WS 打开后再 flush。
+    const stream = { role: "ws", localWs: null, pending: [], opened: false };
+    streams.set(msg.id, stream);
+    let localWs;
+    try {
+      localWs = new WebSocket(url);
+    } catch (e) {
+      send({ t: "ws-close", id: msg.id, code: 1011 });
+      streams.delete(msg.id);
+      return;
+    }
+    stream.localWs = localWs;
+    localWs.on("open", () => {
+      stream.opened = true;
+      for (const chunk of stream.pending) {
+        try {
+          localWs.send(chunk);
+        } catch {}
+      }
+      stream.pending = [];
+    });
+    localWs.on("message", (data) => send({ t: "data", id: msg.id, chunk: b64(data) }));
+    localWs.on("close", (code) => {
+      send({ t: "ws-close", id: msg.id, code: code || 1000 });
+      streams.delete(msg.id);
+    });
+    localWs.on("error", () => {
+      try {
+        localWs.close();
+      } catch {}
+    });
+  }
+
+  function handleData(msg) {
+    const s = streams.get(msg.id);
+    if (!s) return;
+    const buf = unb64(msg.chunk || "");
+    if (s.role === "http" && s.req) {
+      try {
+        s.req.write(buf);
+      } catch {}
+    } else if (s.role === "ws") {
+      if (s.opened && s.localWs && s.localWs.readyState === WebSocket.OPEN) {
+        try {
+          s.localWs.send(buf);
+        } catch {}
+      } else {
+        s.pending.push(buf);
+      }
+    }
+  }
+
+  function endStream(id) {
+    const s = streams.get(id);
+    if (!s) return;
+    if (s.role === "http" && s.req) {
+      try {
+        s.req.end();
+      } catch {}
+    }
+    streams.delete(id);
+  }
+
+  function closeWsStream(msg) {
+    const s = streams.get(msg.id);
+    if (s && s.role === "ws" && s.localWs) {
+      try {
+        s.localWs.close(msg.code || 1000);
+      } catch {}
+    }
+    streams.delete(msg.id);
+  }
+
+  function closeAllStreams() {
+    for (const [, s] of streams) {
+      try {
+        if (s.req) s.req.destroy();
+        if (s.localWs) s.localWs.close();
+      } catch {}
+    }
+    streams.clear();
+  }
+
+  async function connect() {
+    localToken = await ensureLocalToken();
+    const sep = cfg.url.includes("?") ? "&" : "?";
+    const auth = `${sep}device=${encodeURIComponent(cfg.deviceId)}&secret=${encodeURIComponent(cfg.secret)}`;
+    let target = cfg.url;
+    // 允许 env 里只写 wss://host:port 不带路径；统一挂到 /agent
+    if (!/\/(agent|tunnel)\b/.test(target)) target = target.replace(/\/?$/, "/agent");
+    const fullUrl = target + auth;
+    diagnosticLog("relay", "connecting", { url: target, deviceId: cfg.deviceId });
+    try {
+      ws = new WebSocket(fullUrl);
+    } catch (e) {
+      diagnosticWarn("relay", "connect_failed", { error: String(e) });
+      scheduleReconnect();
+      return;
+    }
+    ws.on("open", () => {
+      reconnectDelay = 1000;
+      send({ t: "register", deviceId: cfg.deviceId, name: cfg.deviceName, secret: cfg.secret });
+      pingTimer = setInterval(() => send({ t: "ping" }), 25_000);
+      if (pingTimer && typeof pingTimer.unref === "function") pingTimer.unref();
+      diagnosticLog("relay", "connected", { deviceId: cfg.deviceId });
+    });
+    ws.on("message", (raw) => {
+      let msg;
+      try {
+        msg = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      switch (msg.t) {
+        case "register-ok":
+          diagnosticLog("relay", "registered", { deviceId: cfg.deviceId });
+          break;
+        case "register-reject":
+          diagnosticWarn("relay", "register_rejected", { reason: msg.reason || "unknown" });
+          closedByServer = true;
+          try {
+            ws.close();
+          } catch {}
+          break;
+        case "open":
+          openHttpStream(msg);
+          break;
+        case "ws-open":
+          openWsStream(msg);
+          break;
+        case "data":
+          handleData(msg);
+          break;
+        case "end":
+          endStream(msg.id);
+          break;
+        case "ws-close":
+          closeWsStream(msg);
+          break;
+        case "ping":
+          send({ t: "pong" });
+          break;
+        default:
+          break;
+      }
+    });
+    ws.on("close", () => onClose());
+    ws.on("error", () => {
+      try {
+        ws.close();
+      } catch {}
+    });
+  }
+
+  function onClose() {
+    if (pingTimer) clearInterval(pingTimer);
+    pingTimer = null;
+    closeAllStreams();
+    if (closedByServer) {
+      diagnosticWarn("relay", "stopped_by_server", { deviceId: cfg.deviceId });
+      return;
+    }
+    diagnosticWarn("relay", "disconnected", { deviceId: cfg.deviceId, retryMs: reconnectDelay });
+    scheduleReconnect();
+  }
+
+  function scheduleReconnect() {
+    const delay = reconnectDelay;
+    reconnectDelay = Math.min(MAX_DELAY, reconnectDelay * 2);
+    const t = setTimeout(() => {
+      connect().catch(() => scheduleReconnect());
+    }, delay);
+    if (t && typeof t.unref === "function") t.unref();
+  }
+
+  connect().catch((e) => diagnosticWarn("relay", "init_failed", { error: String(e) }));
+
+  return {
+    started: true,
+    stop() {
+      closedByServer = true;
+      try {
+        ws && ws.close();
+      } catch {}
+      if (pingTimer) clearInterval(pingTimer);
+      closeAllStreams();
+    },
+  };
+}
+
+module.exports = { startReverseTunnel };
