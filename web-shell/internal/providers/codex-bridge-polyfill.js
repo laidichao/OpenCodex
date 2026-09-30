@@ -1986,12 +1986,22 @@
   let coordinationDispatcher = null;
   let coordinationListenerReady = () => false;
   const pendingCoordinationSnapshots = new Map();
+  // 排队广播是完整队列，初始化期间每个线程只保留最新一份，包含空队列的清空通知。
+  const pendingQueuedFollowUps = new Map();
   w.__opencodexInstallCoordinationDispatcher = (dispatcher, hasListener) => {
     if (typeof dispatcher !== "function" || typeof hasListener !== "function") return;
     coordinationDispatcher = dispatcher;
     coordinationListenerReady = hasListener;
+    // dispatcher 若晚于 listener 安装，补发就绪检查，避免初始化缓存永远等不到下一次注册。
+    w.__opencodexCoordinationListenerReady?.("thread-stream-state-changed");
+    w.__opencodexCoordinationListenerReady?.("thread-queued-followups-changed");
   };
   w.__opencodexCoordinationListenerReady = (channel) => {
+    if (channel === "thread-queued-followups-changed" && coordinationListenerReady(channel)) {
+      for (const payload of pendingQueuedFollowUps.values()) coordinationDispatcher(channel, payload);
+      pendingQueuedFollowUps.clear();
+      return;
+    }
     if (channel !== "thread-stream-state-changed" || !coordinationListenerReady(channel)) return;
     // 首个完整快照与紧随的增量按接收顺序交给 manager，不能只重放快照而丢掉其 revision 链。
     for (const packets of pendingCoordinationSnapshots.values()) {
@@ -2017,9 +2027,23 @@
     }
     if (pendingCoordinationSnapshots.size > 512) pendingCoordinationSnapshots.delete(pendingCoordinationSnapshots.keys().next().value);
   });
+  subscribe("thread-queued-followups-changed", (payload) => {
+    // 与 AppHost 原生事件使用同一个队列协调器，不能另写 Web 本地队列覆盖桌面真源。
+    if (coordinationDispatcher && coordinationListenerReady("thread-queued-followups-changed")) {
+      coordinationDispatcher("thread-queued-followups-changed", payload);
+      return;
+    }
+    const params = payload?.params;
+    if (!params?.conversationId || !Array.isArray(params.messages)) return;
+    const key = `${params.hostId || "local"}:${params.conversationId}`;
+    pendingQueuedFollowUps.set(key, payload);
+    if (pendingQueuedFollowUps.size > 512) pendingQueuedFollowUps.delete(pendingQueuedFollowUps.keys().next().value);
+  });
   for (const channel of ["client-status-changed", "ipc-connection-reset"]) {
     subscribe(channel, (payload) => {
       pendingCoordinationSnapshots.clear();
+      // 连接失效后不能把旧 owner 的排队内容重放到新会话持有者。
+      pendingQueuedFollowUps.clear();
       coordinationDispatcher?.(channel, payload);
     });
   }

@@ -92,6 +92,13 @@
         font-size: var(--text-sm, 13px);
         line-height: 18px;
       }
+      .device-name {
+        margin: 8px 0 0;
+        color: var(--color-token-text-primary, #1a1c1f);
+        font-weight: var(--font-weight-semibold, 600);
+        /* 设备名称可能包含很长的主机名，窄屏下也必须完整显示且不撑宽密码面板。 */
+        overflow-wrap: anywhere;
+      }
       form {
         margin-top: 18px;
       }
@@ -518,6 +525,8 @@
       <main class="entry" aria-live="polite">
         <section class="panel">
           <h1>OpenCodex</h1>
+          <!-- 中继按当前设备填入名称，本机访问时保持隐藏。 -->
+          <p id="device-name" class="device-name hidden"></p>
           <p id="status" class="status" data-i18n="web.status.checkingAuth">正在检查访问权限...</p>
           <form id="login-form" class="hidden" autocomplete="on">
             <label for="password" data-i18n="web.auth.passwordLabel">访问密码</label>

@@ -258,6 +258,15 @@ function createOfficialLiveObserver(options = {}) {
       return;
     }
 
+    if (method === "thread-queued-followups-changed") {
+      // 排队状态独立于会话 snapshot/patch 发布；只同步已订阅线程当前 owner 的完整队列。
+      if (!key || !knownThreads.has(key) || !Array.isArray(params.messages)) return;
+      const ownerClientId = activeOwners.get(key);
+      if (ownerClientId && ownerClientId !== message.sourceClientId) return;
+      emit(method, message);
+      return;
+    }
+
     if (method === "thread-stream-state-changed") {
       if (!key) return;
       const change = params.change && typeof params.change === "object" ? params.change : null;

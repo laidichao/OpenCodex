@@ -415,7 +415,7 @@ function readOfficialFeatureCache(profileRoot, identity) {
         const cached = JSON.parse(raw);
         const payload = typeof cached.data === "string" ? JSON.parse(cached.data) : null;
         const user = payload?.user;
-        // 登录态缓存必须精确匹配身份；匿名缓存只允许同步设备级导航布局，不复用账号功能。
+        // 登录态缓存必须精确匹配身份；匿名缓存只同步设备级导航和队列协议，不复用账号功能。
         let anonymousDeviceCache = false;
         if (user) {
           if (user.userID !== identity.userId || user.customIDs?.account_id !== identity.accountId
@@ -434,8 +434,15 @@ function readOfficialFeatureCache(profileRoot, identity) {
         if (!gates || typeof gates !== "object" || Array.isArray(gates)) continue;
         // 匿名缓存缺少导航评估时不能覆盖先前已匹配的有效评估。
         if (anonymousDeviceCache && typeof gates["3085093835"]?.value !== "boolean") continue;
-        // 此 ID 是官方导航布局协议开关；值来自当前设备缓存，绝不固定开启。
-        selected = anonymousDeviceCache ? { "3085093835": gates["3085093835"] } : gates;
+        // 导航与本地服务端队列必须和桌面保持一致，否则服务端接收后临时队列清空，Web 却无法显示。
+        selected = gates;
+        if (anonymousDeviceCache) {
+          selected = {};
+          // 仅复制已验证设备的实际布尔值，不固定开启，也不传递其他账号功能。
+          for (const name of ["3085093835", "2120612410"]) {
+            if (typeof gates[name]?.value === "boolean") selected[name] = gates[name];
+          }
+        }
         selectedSequence = entry.sequence;
       } catch {
         // 未完整写入或旧 SDK 形态继续回退为无可靠缓存。

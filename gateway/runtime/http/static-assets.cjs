@@ -1542,8 +1542,13 @@ ${pluginGatewayStateBootstrapScript()}
 
   /** 把独立 observer 的状态事件交给官方 AppHost 共用的 renderer 分发器。 */
   function patchLiveSidebarState(source) {
-    // observer 已订阅侧栏目录；未打开的会话也需接收完整快照，增量仍受官方 owner/revision 校验。
+    // 桌面把临时消息移入服务端队列后会广播空队列；follower 必须重新读取真源，不能只清空临时状态。
     let patched = source.replace(
+      /(this\.disposed\|\|([\w$]+)\?\.role!==`follower`\|\|\2\.ownerClientId!==([\w$]+)\)return;)(let ([\w$]+)=this\.pending\.get\(([\w$]+)\.conversationId\);)/,
+      '$1this.loadSubscribedMessages($6.conversationId);$4'
+    );
+    // observer 已订阅侧栏目录；未打开的会话也需接收完整快照，增量仍受官方 owner/revision 校验。
+    patched = patched.replace(
       /handleThreadStreamStateChanged\(([\w$]+),([\w$]+),([\w$]+)\)\{if\(!this\.followedConversationIds\.has\(\1\)\)return;/,
       'handleThreadStreamStateChanged($1,$2,$3){if(!this.followedConversationIds.has($1)&&$2.type!==`snapshot`&&this.getStreamRole($1)?.role!==`follower`)return;'
     );

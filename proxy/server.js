@@ -315,12 +315,17 @@ function deviceScopeBootstrap() {
   };
 }
 
-function rewriteDeviceHtml(buf, accessPath) {
+function rewriteDeviceHtml(buf, accessPath, deviceName) {
   const prefix = `/d/${accessPath}`;
   let html = buf.toString("utf8");
   // 初始脚本、样式和预载资源也必须隔离；相对模块导入会自然沿用此设备前缀。
   html = html.replace(/((?:src|href)=["'])\/(?!\/|d\/)([^"']*)(["'])/g,
     (match, start, resource, end) => `${start}${prefix}/${resource}${end}`);
+  // 密码页展示当前隧道所属设备；转义名称并用回调替换，避免 HTML 注入及名称中的 $ 被解释。
+  if (typeof deviceName === "string" && deviceName.trim()) {
+    html = html.replace('<p id="device-name" class="device-name hidden"></p>',
+      () => `<p id="device-name" class="device-name">${escapeHtml(deviceName)}</p>`);
+  }
   const bootstrap = `<script src="${prefix}/opencodex-device-scope.js"></script>`;
   // 外部同源脚本遵守页面 CSP，不增加 unsafe-inline；密码页也在首个 fetch 前安装。
   return Buffer.from(/<head\b[^>]*>/i.test(html)
@@ -764,7 +769,8 @@ function handleProxyFrame(dev, msg) {
           else if (encoding === "br") body = zlib.brotliDecompressSync(body);
           else if (encoding === "deflate") body = zlib.inflateSync(body);
           // 页面资源和配置都固定访问后缀，保留设备语言、插件及认证配置，不使用内部 MAC。
-          out = s._html ? rewriteDeviceHtml(body, dev.accessPath) : rewriteConfigWsUrl(body, dev.accessPath);
+          // 名称与资源路由均来自本次请求的设备，密码页不能借用其他设备的信息。
+          out = s._html ? rewriteDeviceHtml(body, dev.accessPath, dev.name) : rewriteConfigWsUrl(body, dev.accessPath);
           s._headers = { ...s._headers };
           delete s._headers["content-encoding"];
           // 已缓冲的改写响应使用最终长度，不能同时保留设备端的分块传输头。

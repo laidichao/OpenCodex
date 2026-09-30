@@ -89,18 +89,13 @@ function desktopAccountProfileForRenderer() {
 /** 只发布当前桌面真实功能布尔值，缓存中的用户信息和完整响应不得进入配置。 */
 function desktopFeatureGatesForRenderer(profile, appVersion, locale) {
   if (!profile) return {};
-  // 官方持久化的身份缓存用于确认设备稳定 ID 的归属，不从其中推断侧栏开关。
-  const atoms = desktopPersistedAtoms();
-  let stableId = null;
-  try {
-    const identity = JSON.parse(atoms["mini-style-cache"]?.key || "null");
-    if (identity?.accountId === profile.accountId && identity?.userId === profile.userId
-        && identity?.appVersion === appVersion && identity?.locale === locale) stableId = identity.stableId;
-  } catch {
-    // 身份缓存不完整时只接受带完整账号身份的真实 evaluations。
-  }
   // 复用项目的官方数据目录解析，不绑定任何用户名或开发者路径。
   const profileRoot = path.join(officialDataDir(), "web", "Codex");
+  // 官方 Statsig 从此文件读取设备 ID；mini-style-cache 属于另一套身份，不能用于匹配匿名导航评估。
+  const statsigState = readJsonObject(path.join(profileRoot, "statsig-state.json"));
+  const deviceId = statsigState?.["statsig-stable-id"];
+  // 文件缺失或内容无效时只接受带完整账号身份的评估，绝不猜测设备归属。
+  const stableId = typeof deviceId === "string" && deviceId.trim() ? deviceId : null;
   // 只读官方 profile，并以账号、用户、应用版本和语言限制缓存复用。
   const cached = readOfficialFeatureCache(profileRoot, { ...profile, appVersion, locale, stableId });
   const gates = {};
