@@ -83,10 +83,14 @@ test("restores app-host downlink before the first post-reconnect data frame", as
     createAppHostRelay({ onMessage }) {
       let resolveClosed;
       const relay = {
+        closed: false,
         closedPromise: new Promise((resolve) => {
           resolveClosed = resolve;
         }),
-        close: resolveClosed,
+        close() {
+          this.closed = true;
+          resolveClosed();
+        },
         emitMessage: onMessage,
         postMessage() {},
       };
@@ -115,7 +119,7 @@ test("restores app-host downlink before the first post-reconnect data frame", as
 
   first.close();
   await waitForClose(first);
-  await relays[0].closedPromise;
+  assert.equal(relays[0].closed, false);
 
   const second = new WebSocket(url);
   sockets.push(second);
@@ -130,9 +134,9 @@ test("restores app-host downlink before the first post-reconnect data frame", as
     second,
     (message) => message.type === "app-host-port-message" && message.data === "thread/updated"
   );
-  relays[1].emitMessage("thread/updated");
+  relays[0].emitMessage("thread/updated");
   await officialMessage;
-  assert.equal(relays.length, 2);
+  assert.equal(relays.length, 1);
 });
 
 test("replaces an overlapping socket for the same browser client before broadcasts", async (t) => {
