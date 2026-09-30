@@ -1947,11 +1947,18 @@
   /** 为新版 AppHost 的登录后初始化返回现有 Web 默认配置，避免绕过 fetch 拦截后跨网超时。 */
   function buildPostLoginStatsigBootstrap(request) {
     const stableId = typeof request.stable_id === "string" ? request.stable_id : "";
+    // 登录后的配置发布必须携带宿主身份，官方执行服务按用户与账号匹配，缺失时首条消息会被拒绝。
+    const profile = cfg.desktopAccountProfile;
+    const hasChatGptIdentity = typeof profile?.userId === "string" && typeof profile?.accountId === "string";
     const user = {
+      ...(hasChatGptIdentity ? { userID: profile.userId, custom: { auth_method: "chatgpt" } } : {}),
       ...(typeof request.locale === "string" ? { locale: request.locale } : {}),
       ...(typeof request.app_version === "string" ? { appVersion: request.app_version } : {}),
-      ...(stableId
-        ? { customIDs: { stableID: stableId, source_surface_stable_id: stableId } }
+      ...(stableId || hasChatGptIdentity
+        ? { customIDs: {
+            ...(stableId ? { stableID: stableId, source_surface_stable_id: stableId } : {}),
+            ...(hasChatGptIdentity ? { account_id: profile.accountId } : {}),
+          } }
         : {}),
     };
     return {

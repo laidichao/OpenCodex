@@ -407,6 +407,31 @@ function dashboardHtml(username) {
  .mini.danger:hover{background:#7f1d1d;color:#fecaca}
  .empty{color:#8b8f98;background:#141821;border:1px dashed #2a3140;border-radius:13px;padding:34px;text-align:center;font-size:13.5px;line-height:1.9}
  .empty b{color:#c9cdd4}
+ /* 手机端按顶栏、表单、设备信息和操作区顺序折行，长名称与密钥不能撑开页面。 */
+ @media(max-width:640px){
+  header{align-items:flex-start;flex-direction:column;gap:14px;padding:16px}
+  .hd-left,.hd-right{min-width:0;max-width:100%;flex-wrap:wrap}
+  .hd-left .sub{margin-left:0}
+  .hd-right{gap:8px}
+  .hd-right>span:not(.avatar){overflow-wrap:anywhere;min-width:0;max-width:100%}
+  main{padding:20px 16px 40px}
+  .manage{flex-direction:column}
+  .manage input{min-width:0;width:100%;font-size:16px}
+  .port-settings .manage{align-items:stretch}
+  .port-settings input{max-width:none}
+  .grid{grid-template-columns:minmax(0,1fr)}
+  .card{align-items:stretch;flex-direction:column;padding:16px;gap:14px}
+  .dev-name{flex-wrap:wrap}
+  .dev-name a{min-width:0;max-width:100%;overflow-wrap:anywhere}
+  .devid{overflow-wrap:anywhere}
+  .secret-row{min-width:0;max-width:100%}
+  .secret{min-width:0;flex:1}
+  .secret-row .mini{flex-shrink:0}
+  .actions{width:100%}
+  .actions>*{flex:1;text-align:center}
+  button,.open-btn{min-height:44px;display:inline-flex;align-items:center;justify-content:center}
+  #toast{max-width:calc(100% - 32px);width:max-content;overflow-wrap:anywhere}
+ }
 </style></head><body>
 <header>
  <div class="hd-left"><span class="dot"></span><b>OpenCodex 设备看板</b><span class="sub">设备反连 · 零公网暴露</span></div>
@@ -422,7 +447,7 @@ function dashboardHtml(username) {
   <p id="portResult" role="status">修改前请放行新端口；保存成功后需在 PC 启动器同步修改中继端口。HTTPS 反向代理需同步更新上游配置。</p>
  </section>
  <div class="manage">
-  <input id="newName" placeholder="设备名称（如 办公机），可留空自动生成" />
+  <input id="newName" aria-label="设备名称" placeholder="设备名称（如 办公机），可留空自动生成" />
   <button onclick="addDevice()">＋ 添加设备</button>
  </div>
  <div class="grid" id="grid"></div>
