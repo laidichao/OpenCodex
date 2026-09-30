@@ -34,6 +34,7 @@ const PROXY_ENDPOINT = "/openCodeProxy";
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12h，滑动续期
 const SESSION_COOKIE = "ocx_session";
 const DEVICE_COOKIE = "ocx_device";
+const GATEWAY_AUTH_COOKIE = "codex_web_auth";
 const DEVICE_COOKIE_TTL_S = 7 * 24 * 60 * 60; // 7 天
 
 function parseEnvSecrets() {
@@ -523,9 +524,11 @@ function proxyHttpRequest(req, res, parsed, { bindDeviceCookie = false } = {}) {
   const rest = parsed.rest;
   const headers = Object.assign({}, req.headers);
   delete headers["connection"];
-  // 清掉浏览器侧会话 cookie/凭证，PC 网关有自己的访问控制，不透传 VPS 这层。
+  // 只剥离中继管理员会话；Gateway 自己的登录 Cookie 必须到达设备端执行访问密码校验。
   delete headers["authorization"];
   delete headers["cookie"];
+  const gatewayCookie = parseCookies(req)[GATEWAY_AUTH_COOKIE];
+  if (gatewayCookie) headers.cookie = `${GATEWAY_AUTH_COOKIE}=${encodeURIComponent(gatewayCookie)}`;
 
   const fwdHeaders = {};
   for (const [k, v] of Object.entries(headers)) fwdHeaders[k] = v;
@@ -943,8 +946,10 @@ browserWss.on("connection", (bws, req) => {
   const streamId = genId();
   const stream = { role: "ws", browserWs: bws };
   dev.streams.set(streamId, stream);
-  // client 端收到 ws-open 后连 PC 本机 gateway /ws（自动附带本地访问 token）。
-  dev.socket.send(JSON.stringify({ t: "ws-open", id: streamId, path: parsed.rest || "/ws", headers: {} }));
+  // WebSocket 只转发 Gateway 登录态，使实时连接继续执行与 HTTP 相同的访问密码校验。
+  const gatewayCookie = parseCookies(req)[GATEWAY_AUTH_COOKIE];
+  const headers = gatewayCookie ? { cookie: `${GATEWAY_AUTH_COOKIE}=${encodeURIComponent(gatewayCookie)}` } : {};
+  dev.socket.send(JSON.stringify({ t: "ws-open", id: streamId, path: parsed.rest || "/ws", headers }));
   const b64 = (buf) => Buffer.from(buf).toString("base64");
   bws.on("message", (raw, isBinary) => {
     try {

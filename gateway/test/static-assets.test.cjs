@@ -379,7 +379,7 @@ test("compatibility capabilities preserve renderer HTML output byte for byte", (
   compatibilityService.dispose();
 });
 
-test("renderer defers injected runtime only when official scripts preserve its execution order", (t) => {
+test("renderer loads host locale before official scripts and defers the remaining runtime when safe", (t) => {
   const cases = [
     ["module", '<script data-official-case="module" type="module" src="./assets/module.js"></script>', true],
     ["deferred-classic", '<script data-official-case="deferred-classic" defer src="./assets/legacy.js"></script>', true],
@@ -397,7 +397,8 @@ test("renderer defers injected runtime only when official scripts preserve its e
     );
     const html = createService(webviewDir).createRendererResponse();
     const deferAttribute = deferred ? " defer" : "";
-    const configScript = `<script${deferAttribute} src="/codex-web-config.js"></script>`;
+    // 配置脚本负责设置官方模块首次读取的语言，因此无论官方脚本类型都必须阻塞解析执行。
+    const configScript = '<script src="/codex-web-config.js"></script>';
     const bootstrapScript = `<script${deferAttribute} src="${OPENCODEX_RUNTIME_BOOTSTRAP_PATH}"></script>`;
 
     assert.equal(html.includes(configScript), true, name);

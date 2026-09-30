@@ -2491,12 +2491,40 @@ async function webConfigScript(options = {}) {
       ? options.gatewayPluginConfig
       : null;
   return `(() => {
+  const locale = ${JSON.stringify(i18n.locale)};
+  // 中继浏览器可能使用英文系统语言；在官方模块读取浏览器偏好前同步覆盖为主机语言。
+  try {
+    document.documentElement.lang = locale;
+  } catch {}
+  try {
+    Object.defineProperty(navigator, "language", { configurable: true, get: () => locale });
+  } catch {}
+  try {
+    Object.defineProperty(navigator, "languages", {
+      configurable: true,
+      get: () => [locale, "zh-CN", "zh", "en-US", "en"],
+    });
+  } catch {}
+  // 官方 LocaleResolver 读取 Intl 的默认语言；仅覆盖 navigator 无法改变 Chromium 的 ICU 默认值。
+  try {
+    const nativeDateTimeFormat = Intl.DateTimeFormat;
+    Intl.DateTimeFormat = new Proxy(nativeDateTimeFormat, {
+      apply(target, thisArg, args) {
+        const localizedArgs = args.length === 0 || args[0] === undefined ? [locale, ...args.slice(1)] : args;
+        return Reflect.apply(target, thisArg, localizedArgs);
+      },
+      construct(target, args, newTarget) {
+        const localizedArgs = args.length === 0 || args[0] === undefined ? [locale, ...args.slice(1)] : args;
+        return Reflect.construct(target, localizedArgs, newTarget);
+      },
+    });
+  } catch {}
   window.__CODEX_WEB_CONFIG__ = {
     gatewayBaseUrl: location.origin,
     gatewayWsUrl: location.origin.replace(/^http/, "ws") + "/ws",
     workspaceRoots: ${JSON.stringify(workspaceRootsFromEnv())},
     homeDir: ${JSON.stringify(os.homedir())},
-    locale: ${JSON.stringify(i18n.locale)},
+    locale,
     localeSource: ${JSON.stringify(i18n.source || "")},
     localeMode: ${JSON.stringify(i18n.mode || "")},
     messages: ${JSON.stringify(i18n.messages)},

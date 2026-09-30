@@ -20,6 +20,16 @@ const { readRelayConfig } = require("./relay-config.cjs");
 const b64 = (buf) => Buffer.from(buf).toString("base64");
 const unb64 = (s) => Buffer.from(s, "base64");
 
+function gatewayAuthCookie(value) {
+  // 设备端只接收 Gateway 登录 Cookie，避免把中继管理员会话转交给本机服务。
+  const cookies = String(value || "").split(";");
+  for (const part of cookies) {
+    const cookie = part.trim();
+    if (cookie.startsWith("codex_web_auth=")) return cookie;
+  }
+  return "";
+}
+
 function resHeaders(res) {
   const out = {};
   for (const [k, v] of Object.entries(res.headers || {})) out[k] = v;
@@ -38,7 +48,6 @@ function startReverseTunnel({ diagnosticLog = () => {}, diagnosticWarn = () => {
   let reconnectDelay = 1000;
   const MAX_DELAY = 30_000;
   const streams = new Map(); // id -> { role:'http'|'ws', req?, localWs? }
-  let localToken = "";
   let pingTimer = null;
 
   const send = (obj) => {
@@ -55,40 +64,16 @@ function startReverseTunnel({ diagnosticLog = () => {}, diagnosticWarn = () => {
 
   const genId = () => crypto.randomBytes(8).toString("hex");
 
-  function ensureLocalToken() {
-    return new Promise((resolve) => {
-      if (!cfg.authPasswordHash) return resolve(""); // 无密码模式：本地 /ws 无需 token
-      const body = JSON.stringify({ passwordHash: cfg.authPasswordHash });
-      const req = http.request(
-        {
-          host: cfg.localHost,
-          port: cfg.localPort,
-          path: "/api/auth/login",
-          method: "POST",
-          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
-        },
-        (res) => {
-          let d = "";
-          res.on("data", (c) => (d += c));
-          res.on("end", () => {
-            try {
-              const j = JSON.parse(d);
-              resolve(j.token || "");
-            } catch {
-              resolve("");
-            }
-          });
-        }
-      );
-      req.on("error", () => resolve(""));
-      req.write(body);
-      req.end();
-    });
-  }
-
   function openHttpStream(msg) {
     const headers = Object.assign({}, msg.headers || {});
-    if (localToken) headers["x-codex-web-token"] = localToken;
+    // 认证必须来自当前浏览器，不能用设备密码换出的令牌替所有中继用户登录。
+    const authCookie = gatewayAuthCookie(headers.cookie);
+    if (authCookie) headers.cookie = authCookie;
+    else delete headers.cookie;
+    if (String(msg.path || "/").split("?", 1)[0] === "/codex-web-config.js") {
+      // 服务器会按 UTF-8 改写该脚本的 WebSocket 地址；压缩正文经文本改写会损坏，因此要求设备端返回明文。
+      headers["accept-encoding"] = "identity";
+    }
     let req;
     try {
       req = http.request(
@@ -118,13 +103,16 @@ function startReverseTunnel({ diagnosticLog = () => {}, diagnosticWarn = () => {
   }
 
   function openWsStream(msg) {
-    const url = `ws://${cfg.localHost}:${cfg.localPort}/ws${localToken ? `?token=${encodeURIComponent(localToken)}` : ""}`;
+    const url = `ws://${cfg.localHost}:${cfg.localPort}/ws`;
+    // WebSocket 沿用浏览器登录态，避免 HTTP 已拦截但实时连接仍被设备级令牌放行。
+    const authCookie = gatewayAuthCookie(msg.headers && msg.headers.cookie);
+    const wsOptions = authCookie ? { headers: { cookie: authCookie } } : {};
     // 浏览器可能在 PC 本地 WS 尚未连上时就把首帧发过来，这里先登记流并缓冲，待本地 WS 打开后再 flush。
     const stream = { role: "ws", localWs: null, pending: [], opened: false };
     streams.set(msg.id, stream);
     let localWs;
     try {
-      localWs = new WebSocket(url);
+      localWs = new WebSocket(url, wsOptions);
     } catch (e) {
       send({ t: "ws-close", id: msg.id, code: 1011 });
       streams.delete(msg.id);
@@ -208,7 +196,7 @@ function startReverseTunnel({ diagnosticLog = () => {}, diagnosticWarn = () => {
   }
 
   async function connect() {
-    localToken = await ensureLocalToken();
+    // 隧道只建立传输连接，Gateway 登录态由每个浏览器会话独立携带。
     const sep = cfg.url.includes("?") ? "&" : "?";
     const auth = `${sep}device=${encodeURIComponent(cfg.deviceId)}&secret=${encodeURIComponent(cfg.secret)}`;
     let target = cfg.url;

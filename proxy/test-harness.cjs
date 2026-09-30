@@ -2,11 +2,13 @@
 // 1) 启动 mock gateway(:3737) 模拟 OpenCodex 本机 gateway（含 /codex-web-config.js、/ws echo、/api/health）
 // 2) 启动真实 openCodeProxy(server.js, :8080)：账号登录（admin/admin 首登强制改密）+ 加密 auth.json
 // 3) 用真实 PC 端 reverse-tunnel-client 反连，把 :3737 推到代理
-// 4) 验证：登录/改密流程、看板、设备页 Set-Cookie、根路径反代、config.js 重写、WS 隧道、加密存储
+// 4) 验证：登录/改密、Gateway 访问密码、设备页 Cookie、根路径反代、config.js 重写、WS 隧道与加密存储
 // 回归背景：
 //   - /openCodeProxy upgrade 曾误套浏览器 Basic Auth，生产（有密码）环境 PC 反连被 destroy（socket hang up）
 //   - 设备 UI 引用根绝对路径资源，曾全部 404 导致设备页加载不出 → 根路径按设备 cookie 反代
+// 测试代理仅监听回环地址，避免本地联调服务暴露到局域网。
 process.env.RELAY_PORT = "8080";
+process.env.RELAY_HOST = "127.0.0.1";
 // legacy/second 是「添加设备」时的占位登记名；PC 反连自报自定义后缀 mock 后自动 re-bind。
 // second 用于验证「同 ID 已被在线设备占用」时的 register-reject 冲突保护。
 process.env.DEVICE_SECRETS = "legacy=testsecret,second=testsecret2";
@@ -19,6 +21,32 @@ const WebSocket = require("ws");
 const http = require("http");
 const fs = require("fs");
 const crypto = require("crypto");
+const GATEWAY_AUTH_COOKIE = "codex_web_auth";
+const GATEWAY_AUTH_TOKEN = "mock-gateway-session";
+const gatewayPasswordDigest = crypto.createHash("sha256");
+gatewayPasswordDigest.update("relay-harness-password", "utf8");
+const GATEWAY_PASSWORD_HASH = gatewayPasswordDigest.digest("hex");
+const GATEWAY_AUTH_CONFIG_PATH = require("os").tmpdir() + `/proxy-gateway-auth-test-${Date.now()}.yaml`;
+process.env.CODEX_WEB_CONFIG_PATH = GATEWAY_AUTH_CONFIG_PATH;
+// 为隧道客户端准备隔离的启用密码配置，确保回归用例覆盖旧的设备级自动登录行为。
+fs.writeFileSync(GATEWAY_AUTH_CONFIG_PATH, 'auth:\n  password: "relay-harness-password"\n', "utf8");
+
+function gatewayAuthSource(req) {
+  // 按 Gateway 的凭据优先级区分浏览器 Cookie 与设备注入的令牌。
+  const tokenHeader = String(req.headers["x-codex-web-token"] || "").trim();
+  if (tokenHeader) return tokenHeader === GATEWAY_AUTH_TOKEN ? "header" : "";
+  const authorization = String(req.headers.authorization || "").match(/^Bearer\s+(.+)$/i);
+  if (authorization) return authorization[1].trim() === GATEWAY_AUTH_TOKEN ? "authorization" : "";
+  const url = new URL(req.url, "http://localhost");
+  const queryToken = String(url.searchParams.get("token") || "").trim();
+  if (queryToken) return queryToken === GATEWAY_AUTH_TOKEN ? "query" : "";
+  const expectedCookie = `${GATEWAY_AUTH_COOKIE}=${GATEWAY_AUTH_TOKEN}`;
+  const cookies = String(req.headers.cookie || "").split(";");
+  for (const part of cookies) {
+    if (part.trim() === expectedCookie) return "cookie";
+  }
+  return "";
+}
 
 // 预置两个账号（admin/admin 首登强制改密 + vault/vault-pass-9），写入与 server.js 同格式的加密
 // auth.json，用于验证改用户名的「重名拒绝」与「旧名失效」分支（纯黑盒无法凭空造第二个账号）。
@@ -44,6 +72,47 @@ require("./server.js");
 
 // --- mock gateway :3737 ---
 const mock = http.createServer((req, res) => {
+  const authSource = gatewayAuthSource(req);
+  const gatewayAuthenticated = !!authSource;
+  if (req.url === "/api/auth/status") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        authRequired: true,
+        authenticated: gatewayAuthenticated,
+        deviceTokenUsed: authSource !== "" && authSource !== "cookie",
+        relayCookieLeaked: /(?:^|;\s*)(?:ocx_session|ocx_device)=/.test(req.headers.cookie || ""),
+      })
+    );
+    return;
+  }
+  if (req.url === "/api/auth/login" && req.method === "POST") {
+    let rawBody = "";
+    req.on("data", (chunk) => (rawBody += chunk));
+    req.on("end", () => {
+      let body = {};
+      try {
+        body = JSON.parse(rawBody || "{}");
+      } catch {}
+      if (body.passwordHash !== GATEWAY_PASSWORD_HASH) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, authenticated: false, error: "Invalid password" }));
+        return;
+      }
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "set-cookie": `${GATEWAY_AUTH_COOKIE}=${GATEWAY_AUTH_TOKEN}; Path=/; HttpOnly; SameSite=Lax`,
+      });
+      res.end(JSON.stringify({ ok: true, authRequired: true, authenticated: true, token: GATEWAY_AUTH_TOKEN }));
+    });
+    return;
+  }
+  if (!gatewayAuthenticated && req.url !== "/") {
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: false, error: "Unauthorized" }));
+    return;
+  }
   if (req.url === "/codex-web-config.js") {
     res.writeHead(200, { "content-type": "application/javascript; charset=utf-8" });
     res.end(
@@ -63,17 +132,21 @@ const mock = http.createServer((req, res) => {
     return;
   }
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-  res.end("<h1>Mock Codex Gateway</h1>");
+  res.end(gatewayAuthenticated ? "<h1>Mock Codex Gateway</h1>" : "<h1>Gateway login required</h1>");
 });
 const mockWss = new WebSocket.Server({ server: mock, path: "/ws" });
-mockWss.on("connection", (ws) => {
+mockWss.on("connection", (ws, req) => {
+  if (!gatewayAuthSource(req)) {
+    ws.close(1008, "Gateway authentication required");
+    return;
+  }
   // echo 保留帧类型：文本进文本出、二进进二进制出，用于校验隧道是否丢失帧类型。
   ws.on("message", (m, isBinary) => {
     if (isBinary) ws.send(Buffer.concat([Buffer.from("echo:"), m]), { binary: true });
     else ws.send("echo:" + m.toString("utf8"));
   });
 });
-mock.listen(3737, () => console.log("[test] mock gateway on :3737"));
+mock.listen(3737, "127.0.0.1", () => console.log("[test] mock gateway on :3737"));
 
 // --- 真实 PC 端 relay client（OpenCodex 仓库内） ---
 process.env.OCX_RELAY_ENABLED = "1";
@@ -89,10 +162,18 @@ startReverseTunnel({
 
 const BASE = "http://127.0.0.1:8080";
 let sessionCookie = "";
+let deviceCookie = "";
+let gatewayCookie = "";
 
 function request(path, { method = "GET", body = null, headers = {} } = {}) {
   return new Promise((resolve, reject) => {
     const data = body ? JSON.stringify(body) : null;
+    // 模拟浏览器同时持有中继会话、设备绑定和 Gateway 登录三类 Cookie。
+    const cookieParts = [];
+    if (sessionCookie) cookieParts.push(sessionCookie);
+    if (deviceCookie) cookieParts.push(deviceCookie);
+    if (gatewayCookie) cookieParts.push(gatewayCookie);
+    const cookieHeader = cookieParts.join("; ");
     const req = http.request(
       BASE + path,
       {
@@ -101,7 +182,7 @@ function request(path, { method = "GET", body = null, headers = {} } = {}) {
           data
             ? { "content-type": "application/json", "content-length": Buffer.byteLength(data) }
             : {},
-          sessionCookie ? { cookie: sessionCookie } : {},
+          cookieHeader ? { cookie: cookieHeader } : {},
           headers
         ),
       },
@@ -121,10 +202,14 @@ function request(path, { method = "GET", body = null, headers = {} } = {}) {
 
 function wsTest(path) {
   return new Promise((resolve) => {
-    const c = new WebSocket(BASE + path, {
-      headers: sessionCookie ? { cookie: sessionCookie } : {},
-    });
-    const result = { textEcho: "", textIsText: null, binEcho: "", binIsBinary: null };
+    // 浏览器 WebSocket 与普通请求携带同一份 Cookie，回归认证边界及帧类型透传。
+    const cookieParts = [];
+    if (sessionCookie) cookieParts.push(sessionCookie);
+    if (deviceCookie) cookieParts.push(deviceCookie);
+    if (gatewayCookie) cookieParts.push(gatewayCookie);
+    const headers = cookieParts.length ? { cookie: cookieParts.join("; ") } : {};
+    const c = new WebSocket(BASE + path, { headers });
+    const result = { textEcho: "", textIsText: null, binEcho: "", binIsBinary: null, closeCode: null };
     let stage = "text";
     c.on("open", () => c.send("ping-from-browser"));
     c.on("message", (data, isBinary) => {
@@ -139,7 +224,10 @@ function wsTest(path) {
         c.close();
       }
     });
-    c.on("close", () => resolve(result));
+    c.on("close", (code) => {
+      result.closeCode = code;
+      resolve(result);
+    });
     c.on("error", () => resolve(result));
     setTimeout(() => resolve(result), 5000);
   });
@@ -190,8 +278,46 @@ setTimeout(async () => {
     // 7) 设备页 200 + 种设备 cookie
     const devPage = await request("/d/mock/");
     const devCookie = (devPage.setCookie || []).find((c) => c.startsWith("ocx_device="));
-    check("设备页 200", devPage.status === 200 && devPage.body.includes("Mock Codex Gateway"));
+    check("未登录设备页显示 Gateway 登录入口", devPage.status === 200 && devPage.body.includes("Gateway login required"));
     check("设备页绑定设备 cookie", !!devCookie && devCookie.includes("ocx_device=mock"), JSON.stringify(devPage.setCookie));
+    deviceCookie = devCookie ? devCookie.split(";")[0] : "";
+
+    // Gateway 密码必须独立于 relay 管理员登录；HTTP 转发只保留 Gateway 自己的登录 Cookie。
+    const anonymousAuth = await request("/api/auth/status");
+    const anonymousAuthBody = JSON.parse(anonymousAuth.body);
+    check(
+      "中继不会用设备令牌绕过 Gateway 密码",
+      anonymousAuthBody.authRequired && !anonymousAuthBody.authenticated && !anonymousAuthBody.deviceTokenUsed
+    );
+    check("转发到设备的 Cookie 不含中继会话", !anonymousAuthBody.relayCookieLeaked);
+    const anonymousHealth = await request("/api/health");
+    check("未输入 Gateway 密码时受保护 API 返回 401", anonymousHealth.status === 401);
+    const badGatewayLogin = await request("/api/auth/login", {
+      method: "POST",
+      body: { passwordHash: "0".repeat(64) },
+    });
+    check("Gateway 错误密码仍被拒绝", badGatewayLogin.status === 401);
+    const anonymousWs = await wsTest("/d/mock/ws");
+    check("未登录 Gateway 的 WebSocket 被拒绝", anonymousWs.closeCode === 1008);
+
+    const gatewayLogin = await request("/api/auth/login", {
+      method: "POST",
+      body: { passwordHash: GATEWAY_PASSWORD_HASH },
+    });
+    let gatewaySetCookie = "";
+    for (const cookie of gatewayLogin.setCookie || []) {
+      if (cookie.startsWith(`${GATEWAY_AUTH_COOKIE}=`)) {
+        gatewaySetCookie = cookie;
+        break;
+      }
+    }
+    gatewayCookie = gatewaySetCookie ? gatewaySetCookie.split(";")[0] : "";
+    check("Gateway 正确密码建立独立登录态", gatewayLogin.status === 200 && !!gatewayCookie);
+    const authenticatedAuth = await request("/api/auth/status");
+    const authenticatedAuthBody = JSON.parse(authenticatedAuth.body);
+    check("Gateway Cookie 经中继到达设备", authenticatedAuthBody.authenticated && !authenticatedAuthBody.relayCookieLeaked);
+    const authenticatedPage = await request("/d/mock/");
+    check("Gateway 登录后设备页开放", authenticatedPage.status === 200 && authenticatedPage.body.includes("Mock Codex Gateway"));
 
     // 8) config.js 重写 gatewayWsUrl
     const cfg = await request("/d/mock/codex-web-config.js");
@@ -295,5 +421,8 @@ setTimeout(async () => {
   }
 
   console.log(pass ? "\n[test] ALL PASS ✅" : "\n[test] FAILED ❌");
+  try {
+    fs.unlinkSync(GATEWAY_AUTH_CONFIG_PATH);
+  } catch {}
   process.exit(pass ? 0 : 1);
 }, 2500);

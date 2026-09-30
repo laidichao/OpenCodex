@@ -3,22 +3,6 @@
 // 这样 OpenCodex 本身完全无感，只在 env 打开时才激活反连。
 const crypto = require("crypto");
 
-let cachedAuthHash = null;
-let authHashLoaded = false;
-
-function localAuthPasswordHash() {
-  // 同进程内直接复用网关已加载的密码 hash，避免重复读取/重写 config.yaml。
-  if (authHashLoaded) return cachedAuthHash;
-  authHashLoaded = true;
-  try {
-    const auth = require("../http/auth.cjs");
-    cachedAuthHash = auth.AUTH_PASSWORD_HASH || "";
-  } catch {
-    cachedAuthHash = "";
-  }
-  return cachedAuthHash;
-}
-
 function readRelayConfig() {
   const enabled = process.env.OCX_RELAY_ENABLED === "1";
   const url = String(process.env.OCX_RELAY_URL || "").trim();
@@ -39,6 +23,7 @@ function readRelayConfig() {
   try {
     localPort = Number(require("../core/config.cjs").PORT) || 3737;
   } catch {}
+  // 隧道配置只描述设备连接；Gateway 密码由访问它的浏览器分别校验。
   return {
     enabled,
     url,
@@ -47,7 +32,6 @@ function readRelayConfig() {
     deviceName,
     localHost: "127.0.0.1",
     localPort,
-    authPasswordHash: localAuthPasswordHash(),
   };
 }
 

@@ -963,15 +963,17 @@ function createStaticAssetService({
     const deferRuntimeScripts = !officialHtmlHasEagerScript(html);
     const runtimeScript = (src) =>
       `<script${deferRuntimeScripts ? " defer" : ""} src="${src}"></script>`;
+    // 官方 LocaleResolver 首次读取后会缓存语言；配置脚本须先同步执行，避免中继延迟让模块先选中英文。
+    const runtimeConfigScript = '<script src="/codex-web-config.js"></script>';
     const runtimeScripts = useRuntimeBundle
       ? [
           '<link rel="preload" as="script" href="/codex-web-config.js">',
           `<link rel="preload" as="script" href="${OPENCODEX_RUNTIME_BOOTSTRAP_PATH}">`,
-          runtimeScript("/codex-web-config.js"),
+          runtimeConfigScript,
           runtimeScript(OPENCODEX_RUNTIME_BOOTSTRAP_PATH),
         ]
       : [
-          runtimeScript("/codex-web-config.js"),
+          runtimeConfigScript,
           runtimeScript(OPENCODEX_MODIFICATION_RUNTIME_PATH),
           runtimeScript(OPENCODEX_RUNTIME_COMPATIBILITY_PATH),
           runtimeScript(OPENCODEX_SIDEBAR_PREVIEW_PATH),
