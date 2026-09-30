@@ -326,8 +326,9 @@ test("runtime compatibility diagnostics are public, grouped, explained, and repo
 test("runtime compatibility page follows the public authentication locale", (t) => {
   const webviewDir = makeOfficialWebviewDir(t);
   for (const [locale, expectedTitle] of [
-    ["zh-CN", "OpenCodex虚拟骨架调试"],
-    ["en-US", "OpenCodex Virtual Skeleton Diagnostics"],
+    // 与现有公开语言字典一致，验证真实页面标题而非已淘汰的旧文案。
+    ["zh-CN", "运行时兼容调试"],
+    ["en-US", "Runtime Compatibility Diagnostics"],
   ]) {
     const service = createService(webviewDir, null, locale);
     const reqPath = "/settings/developer/runtime-compatibility";
@@ -531,6 +532,25 @@ test("patched official renderer hides the app-host application menu capability",
   assert.match(source, /services\.applicationMenu\.getSnapshot\(\)/);
   assert.match(source, /capabilitySnapshot=services\.applicationMenu!=null/);
   assert.doesNotMatch(source, /isWindows\(\)&&services\.applicationMenu!=null/);
+});
+
+test("Statsig AppHost startup reuses local Web initialization with an official fallback", (t) => {
+  const webviewDir = makeOfficialWebviewDir(t);
+  const service = createService(webviewDir);
+  const source = 'function start(e,t){return Tf.safePost(`/wham/statsig/bootstrap`,{requestBody:e,retry:!1,signal:t})}' +
+    'const options={networkOverrideFunc:(e,n)=>lOs(e,n,t.loggingEnabled!==`disabled`)};';
+  // 同时覆盖新版 safePost 及 SDK 的自定义网络入口，Provider 关闭时继续调用官方实现。
+  const patched = service.patchOfficialAssetData(
+    `${PATCHED_OFFICIAL_PREFIX}assets/app-initial-statsig-test.js`, Buffer.from(source),
+    { headers: { host: "example.com" } }
+  ).toString("utf8");
+  assert.match(patched, /window\.__opencodexStatsigBootstrap\(e,t\):Tf\.safePost/);
+  assert.match(patched, /window\.fetch\(e,n\):lOs\(e,n,t\.loggingEnabled/);
+  // 不属于初始化的普通请求不进入本地配置响应。
+  assert.equal(service.patchOfficialAssetData(
+    `${PATCHED_OFFICIAL_PREFIX}assets/app-initial-statsig-test.js`, Buffer.from('Tf.safePost(`/wham/other`,{})'),
+    { headers: { host: "example.com" } }
+  ).toString("utf8"), 'Tf.safePost(`/wham/other`,{})');
 });
 
 test("large official renderer patches complete off the gateway event loop", async (t) => {
@@ -1069,11 +1089,15 @@ test("pre-renders escaped recent threads and preloads official startup modules",
     html,
     new RegExp(`meta name="opencodex-late-modulepreload" content="${PATCHED_OFFICIAL_PREFIX}assets/zh-CN-Locale01\\.js"`)
   );
+  // 语言包需在配置脚本阻塞解析之前开始下载，旧延迟预载通过现有去重逻辑复用该链接。
+  const localePreload = `link rel="modulepreload" crossorigin href="${PATCHED_OFFICIAL_PREFIX}assets/zh-CN-Locale01.js"`;
+  assert.ok(html.indexOf(localePreload) >= 0);
+  assert.ok(html.indexOf(localePreload) < html.indexOf('<script src="/codex-web-config.js">'));
   assert.match(html, new RegExp(`${PATCHED_OFFICIAL_PREFIX}assets/thread-app-shell-chrome-Wrapper01\\.js`));
   assert.doesNotMatch(html, /thread-app-shell-chrome-Implementation01\.js/);
   assert.match(html, new RegExp(`${PATCHED_OFFICIAL_PREFIX}assets/home-ambient-suggestions-content-Home01\\.js`));
   assert.match(html, new RegExp(`${PATCHED_OFFICIAL_PREFIX}assets/codex-home-announcements-Wrapper01\\.js`));
-  assert.doesNotMatch(
+  assert.match(
     html,
     new RegExp(`link rel="modulepreload"[^>]+${PATCHED_OFFICIAL_PREFIX}assets/zh-CN-Locale01\\.js`)
   );
@@ -1636,6 +1660,10 @@ test("only caches content-hashed patched assets as immutable", (t) => {
   const assetsDir = path.join(webviewDir, "assets");
   fs.mkdirSync(assetsDir, { recursive: true });
   fs.writeFileSync(path.join(assetsDir, "app-Dk3EPlSk.js"), "export const ready = true;");
+  // 当前官方版本改用 12 位哈希，刷新时仍应复用大脚本而不是重复从中继下载。
+  fs.writeFileSync(path.join(assetsDir, "app-shared-6472dfc83b38.js"), "export const ready = true;");
+  fs.writeFileSync(path.join(assetsDir, "app-initial-0123456789ab.js"),
+    'const labels={file:{id:"windowsMenuBar.file"}};function enabled(){return isWindows()&&services.applicationMenu!=null}');
   fs.writeFileSync(path.join(assetsDir, "OpenAISans-Medium-B7nJY_kG.woff2"), "font");
   fs.writeFileSync(
     path.join(assetsDir, "locale-Ab1_cdEF.js"),
@@ -1665,6 +1693,15 @@ test("only caches content-hashed patched assets as immutable", (t) => {
   const legacy = serveOfficialAssetResponse(service, "/official-patched/assets/app-Dk3EPlSk.js");
 
   assert.equal(current.headers["cache-control"], "public, max-age=31536000, immutable");
+  const currentRolldown = serveOfficialAssetResponse(
+    service, `${PATCHED_OFFICIAL_PREFIX}assets/app-shared-6472dfc83b38.js`
+  );
+  assert.equal(currentRolldown.headers["cache-control"], "public, max-age=31536000, immutable");
+  // 主包的静态补丁随命名空间升级失效；主机语言文案补丁仍保持逐次 ETag 校验。
+  const staticPatched = serveOfficialAssetResponse(
+    service, `${PATCHED_OFFICIAL_PREFIX}assets/app-initial-0123456789ab.js`
+  );
+  assert.equal(staticPatched.headers["cache-control"], "private, max-age=31536000, immutable");
   assert.equal(font.headers["cache-control"], "public, max-age=31536000, immutable");
   assert.equal(dynamic.headers["cache-control"], "private, no-cache, must-revalidate");
   assert.match(dynamic.body.toString("utf-8"), /下载文件/);

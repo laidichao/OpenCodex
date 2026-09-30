@@ -20,7 +20,17 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const zlib = require("zlib");
 const { WebSocketServer } = require("ws");
+
+// 中继 JSON 包含 base64 正文和会话快照；大帧压缩可减少公网传输，不跨帧复用凭证压缩上下文。
+const wsCompressionOptions = {
+  threshold: 1024,
+  clientNoContextTakeover: true,
+  serverNoContextTakeover: true,
+  concurrencyLimit: 4,
+  zlibDeflateOptions: { level: 1 },
+};
 
 const PORT = Number(process.env.RELAY_PORT || 8443);
 const HOST = process.env.RELAY_HOST || "0.0.0.0";
@@ -542,6 +552,11 @@ function proxyHttpRequest(req, res, parsed, { bindDeviceCookie = false } = {}) {
       ? `${DEVICE_COOKIE}=${encodeURIComponent(dev.id)}; Path=/; SameSite=Lax; Max-Age=${DEVICE_COOKIE_TTL_S}`
       : "",
     _rewrite: /\/codex-web-config\.js$/.test(rest),
+    // 配置脚本改写后按当前浏览器的协商结果重新压缩，避免关键启动资源以明文走公网。
+    _acceptGzip: String(req.headers["accept-encoding"] || "").split(",").some((part) => {
+      const [encoding, quality] = part.trim().split(";");
+      return encoding === "gzip" && (quality === undefined || Number(quality.trim().replace(/^q=/, "")) > 0);
+    }),
     _buf: [],
     _headWritten: false,
   };
@@ -608,12 +623,36 @@ function handleProxyFrame(dev, msg) {
     if (!s) return;
     if (s.role === "http") {
       let out = null;
-      if (s._rewrite) out = rewriteConfigWsUrl(Buffer.concat(s._buf), dev.id);
       try {
+        if (s._rewrite) {
+          // 先解码设备响应再改写地址；不能把 gzip/br 字节当作 UTF-8，旧版明文设备同样兼容。
+          let body = Buffer.concat(s._buf);
+          const encoding = s._headers?.["content-encoding"];
+          if (encoding === "gzip") body = zlib.gunzipSync(body);
+          else if (encoding === "br") body = zlib.brotliDecompressSync(body);
+          else if (encoding === "deflate") body = zlib.inflateSync(body);
+          // 只改变中继 WebSocket 地址，继续保留 Gateway 的语言、插件和认证配置。
+          out = rewriteConfigWsUrl(body, dev.id);
+          s._headers = { ...s._headers };
+          delete s._headers["content-encoding"];
+          // 已缓冲的改写响应使用最终长度，不能同时保留设备端的分块传输头。
+          delete s._headers["transfer-encoding"];
+          delete s._headers.etag;
+          if (s._acceptGzip) {
+            out = zlib.gzipSync(out, { level: 1 });
+            s._headers["content-encoding"] = "gzip";
+          }
+          s._headers["content-length"] = out.length;
+          s._headers.vary = "Accept-Encoding";
+        }
         if (!s._headWritten) s.res.writeHead(s._status || 200, s._headers || {});
         if (out) s.res.end(out);
         else s.res.end();
-      } catch {}
+      } catch {
+        // 配置解码或改写失败时结束请求，不能让浏览器一直等待缺失的脚本正文。
+        if (!s.res.headersSent) s.res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+        s.res.end("Unable to rewrite gateway configuration");
+      }
       dev.streams.delete(msg.id);
     }
   } else if (msg.t === "ws-close") {
@@ -827,7 +866,7 @@ const server = (tlsOpts ? https.createServer(tlsOpts) : http.createServer()).on(
 );
 
 // ---------- 设备（PC）WebSocket：/openCodeProxy ----------
-const proxyWss = new WebSocketServer({ noServer: true });
+const proxyWss = new WebSocketServer({ noServer: true, perMessageDeflate: wsCompressionOptions });
 proxyWss.on("connection", (ws, req) => {
   const url = new URL(req.url, "http://localhost");
   const rawDeviceId = url.searchParams.get("device") || "";
@@ -930,7 +969,7 @@ proxyWss.on("connection", (ws, req) => {
 // ---------- 浏览器 WebSocket：/d/<id>/ws 与根路径 WS ----------
 // 浏览器 WS 不在 VPS 本机直连任何端口：通过 ws-open 隧道帧交给对应设备的
 // 反连客户端，由它连 PC 本机 gateway 的 /ws 并双向转发（data / ws-close 帧）。
-const browserWss = new WebSocketServer({ noServer: true });
+const browserWss = new WebSocketServer({ noServer: true, perMessageDeflate: wsCompressionOptions });
 browserWss.on("connection", (bws, req) => {
   const url = new URL(req.url, "http://localhost");
   const parsed = parseDevicePath(url.pathname);

@@ -21,6 +21,7 @@ const WebSocket = require("ws");
 const http = require("http");
 const fs = require("fs");
 const crypto = require("crypto");
+const zlib = require("zlib");
 const GATEWAY_AUTH_COOKIE = "codex_web_auth";
 const GATEWAY_AUTH_TOKEN = "mock-gateway-session";
 const gatewayPasswordDigest = crypto.createHash("sha256");
@@ -188,9 +189,11 @@ function request(path, { method = "GET", body = null, headers = {} } = {}) {
       },
       (res) => {
         let d = "";
-        res.on("data", (c) => (d += c));
+        const chunks = [];
+        // 保留原始字节以验证 gzip 配置响应，原有文本断言继续使用 body。
+        res.on("data", (c) => { d += c; chunks.push(c); });
         res.on("end", () =>
-          resolve({ status: res.statusCode, body: d, headers: res.headers, setCookie: res.headers["set-cookie"] })
+          resolve({ status: res.statusCode, body: d, rawBody: Buffer.concat(chunks), headers: res.headers, setCookie: res.headers["set-cookie"] })
         );
       }
     );
@@ -322,6 +325,13 @@ setTimeout(async () => {
     // 8) config.js 重写 gatewayWsUrl
     const cfg = await request("/d/mock/codex-web-config.js");
     check("config.js 重写", cfg.body.includes("/d/mock/ws"), cfg.body.slice(0, 120));
+    // 改写后的配置允许 gzip，长度头必须对应最终压缩字节，且拒绝压缩的客户端仍能读取明文。
+    const compressedCfg = await request("/d/mock/codex-web-config.js", { headers: { "accept-encoding": "gzip" } });
+    check("config.js gzip 正文及长度", compressedCfg.headers["content-encoding"] === "gzip" &&
+      Number(compressedCfg.headers["content-length"]) === compressedCfg.rawBody.length &&
+      zlib.gunzipSync(compressedCfg.rawBody).toString("utf8").includes("/d/mock/ws"));
+    const identityCfg = await request("/d/mock/codex-web-config.js", { headers: { "accept-encoding": "gzip;q=0" } });
+    check("config.js 尊重 gzip 禁用", !identityCfg.headers["content-encoding"] && identityCfg.body.includes("/d/mock/ws"));
 
     // 9) 根路径反代：设备 UI 的根绝对路径资源（按 cookie/唯一在线设备转发）
     const asset = await request("/official-patched-v8/assets/index-test.js");

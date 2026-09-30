@@ -27,7 +27,7 @@ const {
   officialRuntimeTempDir,
   workspaceRootsFromEnv,
 } = require("../core/config.cjs");
-const { persistedAtomSnapshotForRenderer } = require("../state/desktop-state.cjs");
+const { persistedAtomSnapshotForRenderer, desktopAccountProfileForRenderer, desktopFeatureGatesForRenderer } = require("../state/desktop-state.cjs");
 const { diagnosticLog, diagnosticWarn, shortId } = require("../core/diagnostics.cjs");
 const { resolveOpenCodexI18n } = require("../../../shared/i18n/index.cjs");
 const { withPluginI18nMessages } = require("../core/plugin-assets.cjs");
@@ -2485,6 +2485,10 @@ function buildGatewayStatus() {
 async function webConfigScript(options = {}) {
   // 这个脚本由浏览器入口动态加载，避免把本机路径和端口写死到 web-shell 构建产物里。
   const i18n = withPluginI18nMessages(getI18nSnapshot());
+  // 资料和功能缓存共用当前身份，避免生成配置期间切换账号产生不一致快照。
+  const desktopProfile = desktopAccountProfileForRenderer();
+  // 官方缓存只提供真实布尔值，不把 evaluations 中的身份或认证内容带给浏览器。
+  const desktopFeatureGates = desktopFeatureGatesForRenderer(desktopProfile, officialBundle?.version || "", i18n.locale);
   const initialSidebarBootstrap = await initialSidebarBootstrapForRenderer();
   const gatewayPluginConfig =
     options.gatewayPluginConfig && typeof options.gatewayPluginConfig === "object"
@@ -2502,7 +2506,7 @@ async function webConfigScript(options = {}) {
   try {
     Object.defineProperty(navigator, "languages", {
       configurable: true,
-      get: () => [locale, "zh-CN", "zh", "en-US", "en"],
+      get: () => [locale],
     });
   } catch {}
   // 官方 LocaleResolver 读取 Intl 的默认语言；仅覆盖 navigator 无法改变 Chromium 的 ICU 默认值。
@@ -2538,6 +2542,9 @@ async function webConfigScript(options = {}) {
     sharedObjectSnapshot: ${JSON.stringify({ host_config: { id: "local", kind: "local" } })},
     // persistedAtomSnapshot 用于首屏同步：renderer 会很早请求它，此时 WebSocket 可能还没连上。
     persistedAtomSnapshot: ${JSON.stringify(persistedAtomSnapshotForRenderer())},
+    // 登录身份只用于首屏展示和功能缓存归属校验，不包含认证令牌。
+    desktopAccountProfile: ${JSON.stringify(desktopProfile)},
+    desktopFeatureGates: ${JSON.stringify(desktopFeatureGates)},
     // 刷新页面时官方的一次性启动广播已经结束，必须把 main 的同步侧栏快照直接交给 preload bridge。
     initialSidebarBootstrap: ${JSON.stringify(initialSidebarBootstrap)}
   };

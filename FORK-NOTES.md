@@ -1,6 +1,6 @@
-# FORK-NOTES — laidichao/OpenCodex fork 改动与合并手册
+# FORK-NOTES — OpenCodex fork 改动与合并手册
 
-本 fork（`laidichao/OpenCodex`，upstream = `RyensX/OpenCodex`）在原项目上新增了
+本 fork（upstream = `RyensX/OpenCodex`）在原项目上新增了
 **「服务器中继」远程管控能力**（PC 端主动反连 VPS，浏览器经 VPS 统一入口访问各设备）。
 本文档是合并 upstream 时的**唯一权威改动清单**：所有侵入 upstream 文件的位置都带
 `[OCX-FORK]` 注释标记，可用全文搜索 `[OCX-FORK]` 快速定位。
@@ -18,9 +18,9 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `launcher/fork/relay-core.cjs` | launcher 主进程的**全部中继业务逻辑**：字段 normalize、relay settings schema（`RELAY_DEFAULT_FIELDS`/`normalizeRelayFields`）、MAC 设备身份（`ensureRelayIdentity`）、env 转译（`relayChildEnv`）、访问地址拼接（`relayPrimaryUrl`）、`launcher:update-relay` IPC handler（`createRelayIpcHandler`）。通过 `createRelayCore(deps)` 依赖注入，不反向依赖 main.cjs |
+| `launcher/fork/relay-core.cjs` | launcher 主进程的**全部中继业务逻辑**：字段 normalize、relay settings schema（`RELAY_DEFAULT_FIELDS`/`normalizeRelayFields`）、随机设备身份（`ensureRelayIdentity`）、env 转译（`relayChildEnv`）、访问地址拼接（`relayPrimaryUrl`）、`launcher:update-relay` IPC handler（`createRelayIpcHandler`）。通过 `createRelayCore(deps)` 依赖注入，不反向依赖 main.cjs |
 | `launcher/fork/dev-debug.cjs` | dev 期诊断：CDP 9222 端口（`enableDevRemoteDebugging`）、renderer console 转发 + 捕获阶段事件探针（`attachWindowDiagnostics`）。仅 `!app.isPackaged` 生效 |
-| `gateway/runtime/relay/relay-config.cjs` | 反连客户端配置（读 `OCX_RELAY_*` 环境变量，含访问密码 hash 复用） |
+| `gateway/runtime/relay/relay-config.cjs` | 反连客户端配置（读 `OCX_RELAY_*` 环境变量，浏览器登录态独立校验） |
 | `gateway/runtime/relay/reverse-tunnel-client.cjs` | 反向隧道客户端：出站 WS 反连 VPS，多路复用 HTTP/WS（帧协议 register/open/head/data/end/ws-open/ws-close/ping，**逐帧保真含 `bin` 帧类型**） |
 | `proxy/server.js` | VPS 中继服务端：看板（账号密码登录、AES-256-GCM 加密存储 auth.json、改密码/改用户名、登录失败 5 次冻结该 IP 10 分钟带倒计时）、`/d/<id>/` 透明反代（HTTP+WS，逐帧保真）、设备 cookie 根路径通配反代、re-bind 冲突保护 |
 | `proxy/test-harness.cjs` | 服务端 26 用例自测（`node test-harness.cjs`，含 WS 帧类型严格校验、改用户名/重名/冻结回归） |

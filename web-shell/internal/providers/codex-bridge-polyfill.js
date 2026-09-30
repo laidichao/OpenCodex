@@ -23,7 +23,7 @@
       Object.prototype.hasOwnProperty.call(values, name) ? String(values[name]) : match
     );
   }
-  const OPENCODEX_LANGUAGES = [OPENCODEX_LOCALE, "zh-CN", "zh", "en-US", "en"];
+  const OPENCODEX_LANGUAGES = [OPENCODEX_LOCALE];
   const AUTH_FORCE_LOGIN_STORAGE_KEY = "codex_web_force_login";
   const WS_READY_WAIT_TIMEOUT_MS = 2500;
   const CLIENT_DIAGNOSTIC_FLUSH_DELAY_MS = 120;
@@ -1939,6 +1939,13 @@
     try {
       request = payload.body ? JSON.parse(payload.body) : {};
     } catch {}
+    // 旧 IPC 和新版 AppHost 入口共享同一响应，保持语言开关及用户匹配字段一致。
+    emitFetchSuccess(requestId, buildPostLoginStatsigBootstrap(request));
+    return true;
+  }
+
+  /** 为新版 AppHost 的登录后初始化返回现有 Web 默认配置，避免绕过 fetch 拦截后跨网超时。 */
+  function buildPostLoginStatsigBootstrap(request) {
     const stableId = typeof request.stable_id === "string" ? request.stable_id : "";
     const user = {
       ...(typeof request.locale === "string" ? { locale: request.locale } : {}),
@@ -1947,11 +1954,67 @@
         ? { customIDs: { stableID: stableId, source_surface_stable_id: stableId } }
         : {}),
     };
-    emitFetchSuccess(requestId, {
+    return {
       // 官方会先 JSON.parse(statsigPayload) 校验 user，再交给 Statsig data adapter；必须保持字符串协议。
       statsigPayload: JSON.stringify({ ...buildStatsigInitializeResponse(), user }),
+    };
+  }
+
+  // 官方新版 safePost 改走 AppHost RPC；资源补丁在该入口复用现有本地初始化行为。
+  w.__opencodexStatsigBootstrap = async (request, signal) => {
+    signal?.throwIfAborted();
+    modificationEffects?.statsig?.emit();
+    // 保留官方 bootstrap 的 user 校验协议，不写入浏览器语言或帐号偏好。
+    return buildPostLoginStatsigBootstrap(request);
+  };
+
+  // 首屏资料必须属于当前官方登录身份，不能把上一账号的展示信息复用给切换后的账号。
+  w.__opencodexAccountProfile = (accountId, userId) => {
+    const profile = cfg.desktopAccountProfile;
+    if (!profile || profile.accountId !== accountId || profile.userId !== userId) return undefined;
+    return { id: profile.id, name: profile.name, email: profile.email };
+  };
+
+  // 新版 renderer 经 AppHost 订阅协同事件；observer 的独立 IPC 推送要接入相同事件分发器。
+  let coordinationDispatcher = null;
+  let coordinationListenerReady = () => false;
+  const pendingCoordinationSnapshots = new Map();
+  w.__opencodexInstallCoordinationDispatcher = (dispatcher, hasListener) => {
+    if (typeof dispatcher !== "function" || typeof hasListener !== "function") return;
+    coordinationDispatcher = dispatcher;
+    coordinationListenerReady = hasListener;
+  };
+  w.__opencodexCoordinationListenerReady = (channel) => {
+    if (channel !== "thread-stream-state-changed" || !coordinationListenerReady(channel)) return;
+    // 首个完整快照与紧随的增量按接收顺序交给 manager，不能只重放快照而丢掉其 revision 链。
+    for (const packets of pendingCoordinationSnapshots.values()) {
+      for (const payload of packets) coordinationDispatcher(channel, payload);
+    }
+    pendingCoordinationSnapshots.clear();
+  };
+  subscribe("thread-stream-state-changed", (payload) => {
+    if (coordinationDispatcher && coordinationListenerReady("thread-stream-state-changed")) {
+      coordinationDispatcher("thread-stream-state-changed", payload);
+      return;
+    }
+    const params = payload?.params;
+    if (!params?.conversationId) return;
+    const key = `${params.hostId || "local"}:${params.conversationId}`;
+    // 每条初始化缓存必须从完整 snapshot 开始；新 snapshot 覆盖旧基线。
+    if (params.change?.type === "snapshot") pendingCoordinationSnapshots.set(key, [payload]);
+    else if (params.change?.type === "patches") {
+      const packets = pendingCoordinationSnapshots.get(key);
+      if (packets && packets.length < 128) packets.push(payload);
+      // 超限整条丢弃，避免用截断的增量链生成错误状态。
+      else pendingCoordinationSnapshots.delete(key);
+    }
+    if (pendingCoordinationSnapshots.size > 512) pendingCoordinationSnapshots.delete(pendingCoordinationSnapshots.keys().next().value);
+  });
+  for (const channel of ["client-status-changed", "ipc-connection-reset"]) {
+    subscribe(channel, (payload) => {
+      pendingCoordinationSnapshots.clear();
+      coordinationDispatcher?.(channel, payload);
     });
-    return true;
   }
 
   /** Electron 版会把 Statsig 上报转给 main 进程；Web 壳直接确认成功，避免空闲期反复跨进程请求与超时重试。 */
@@ -3407,6 +3470,11 @@
         rule_id: "gateway_override",
         secondary_exposures: [],
       };
+    }
+    // 仅同步宿主验证过身份、版本和语言的真实开关，不能固定开启某一用户的新版功能。
+    for (const [name, value] of Object.entries(cfg.desktopFeatureGates || {})) {
+      if (typeof value !== "boolean") continue;
+      feature_gates[name] = { name, value, rule_id: "desktop_cache", secondary_exposures: [] };
     }
     return {
       has_updates: true,

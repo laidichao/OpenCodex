@@ -33,7 +33,7 @@ const PATCHED_ASSET_CACHE_MAX_BYTES = Math.max(
     ? configuredPatchedAssetCacheMaxBytes
     : 96 * 1024 * 1024
 );
-const PATCHED_ASSET_PATCH_REVISION = "11";
+const PATCHED_ASSET_PATCH_REVISION = "14";
 const ASYNC_PATCH_MIN_BYTES = 512 * 1024;
 const OFFICIAL_ASSET_PATCH_WORKER_IDLE_MS = 30_000;
 const OFFICIAL_ASSET_PATCH_WORKER_PATH = path.join(__dirname, "official-asset-patch-worker.cjs");
@@ -380,6 +380,9 @@ function createStaticAssetService({
     [staticPoints.historyTurnSignals, patchAppServerManagerSignalsChunk],
     [staticPoints.applicationMenu, patchApplicationMenuCapabilityCheck],
     [staticPoints.appServerRequestScheduling, patchAppServerRequestScheduling],
+    [staticPoints.statsigBootstrap, patchStatsigBootstrap],
+    [staticPoints.liveSidebarState, patchLiveSidebarState],
+    [staticPoints.accountProfile, patchAccountProfile],
     [staticPoints.pluginImageLazyLoad, patchPluginSummaryImageInlining],
     [staticPoints.openInFolderLocale, patchOpenInFolderLocaleMessage],
     ...dynamicHtmlPoints.map((point) => [point, () => undefined]),
@@ -409,6 +412,9 @@ function createStaticAssetService({
   const patchHistorySignalsCompatible = capabilityFor(staticPoints.historyTurnSignals);
   const patchApplicationMenuCompatible = capabilityFor(staticPoints.applicationMenu);
   const patchRequestSchedulingCompatible = capabilityFor(staticPoints.appServerRequestScheduling);
+  const patchStatsigBootstrapCompatible = capabilityFor(staticPoints.statsigBootstrap);
+  const patchLiveSidebarStateCompatible = capabilityFor(staticPoints.liveSidebarState);
+  const patchAccountProfileCompatible = capabilityFor(staticPoints.accountProfile);
   const patchPluginImageCompatible = capabilityFor(staticPoints.pluginImageLazyLoad);
   const patchOpenInFolderLocaleCompatible = capabilityFor(staticPoints.openInFolderLocale);
 
@@ -818,6 +824,9 @@ function createStaticAssetService({
 
   function startupAssetPreloads(rawHtml) {
     const urls = new Set();
+    // 新版入口动态导入 app-initial；显式预载，避免中继先下载 shared 大包再串行下载主包。
+    const initialModule = officialAssetFileNames().find((name) => /^app-initial-.*\.js$/.test(name));
+    if (initialModule) urls.add(`/official/assets/${initialModule}`);
     for (const match of rawHtml.matchAll(/<script\b[^>]*\btype=["']module["'][^>]*\bsrc=["']([^"']+)["'][^>]*>/gi)) {
       urls.add(match[1]);
     }
@@ -955,6 +964,8 @@ function createStaticAssetService({
     html = patchHtmlAssetPathsCompatible(html);
     html = patchHtmlFontPreloadsCompatible(html);
     const startupPreloads = startupAssetPreloads(html);
+    // 中文菜单依赖语言包；与主模块并行下载，不能等 window.load 后再排入同一条中继队列。
+    const localePreloadHref = lateLocaleModuleHref(i18n.locale);
     const lateModuleHrefs = lateStartupModuleHrefs(i18n.locale);
     const previewMarkup = sidebarPreviewMarkup(options.sidebarPreview, i18n.locale);
     if (startupPreloads) hitCompatibilityPoint(staticPoints.startupPreload);
@@ -998,6 +1009,7 @@ function createStaticAssetService({
     // manifest 在 Cloudflare Access 等前置认证后面也必须带同源凭据，否则 Chrome 可能拿不到受保护的 manifest。
     const base = [
       '<base href="/official/">',
+      localePreloadHref ? `<link rel="modulepreload" crossorigin href="${escapeHtml(localePreloadHref)}">` : "",
       startupPreloads,
       `<link rel="manifest" href="${PWA_MANIFEST_PATH}" crossorigin="use-credentials">`,
       '<meta name="theme-color" content="#ffffff">',
@@ -1513,12 +1525,71 @@ ${pluginGatewayStateBootstrapScript()}
     return patched;
   }
 
+  /** 只改写官方 Statsig 的两个网络入口，普通 AppHost 请求继续沿用官方 RPC。 */
+  function patchStatsigBootstrap(source) {
+    // 登录后 safePost 绕过 window.fetch；启用 Web Provider 时改为相同的本地配置响应。
+    let patched = source.replace(
+      /([A-Za-z_$][\w$]*\.safePost\(`\/wham\/statsig\/bootstrap`,\{requestBody:([A-Za-z_$][\w$]*),retry:!1,signal:([A-Za-z_$][\w$]*)\}\))/g,
+      "(window.__opencodexStatsigBootstrap?window.__opencodexStatsigBootstrap($2,$3):$1)"
+    );
+    // SDK 的 networkOverrideFunc 同样走 AppHost；初始化仍交给现有 fetch 拦截器，避免十秒超时。
+    patched = patched.replace(
+      /(networkOverrideFunc:\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\)=>)([A-Za-z_$][\w$]*\(\2,\3,[A-Za-z_$][\w$]*\.loggingEnabled!==`disabled`\))/g,
+      "$1(window.__codexWebFetchPatched&&$2.split('?')[0]===`https://ab.chatgpt.com/v1/initialize`?window.fetch($2,$3):$4)"
+    );
+    return patched;
+  }
+
+  /** 把独立 observer 的状态事件交给官方 AppHost 共用的 renderer 分发器。 */
+  function patchLiveSidebarState(source) {
+    // observer 已订阅侧栏目录；未打开的会话也需接收完整快照，增量仍受官方 owner/revision 校验。
+    let patched = source.replace(
+      /handleThreadStreamStateChanged\(([\w$]+),([\w$]+),([\w$]+)\)\{if\(!this\.followedConversationIds\.has\(\1\)\)return;/,
+      'handleThreadStreamStateChanged($1,$2,$3){if(!this.followedConversationIds.has($1)&&$2.type!==`snapshot`&&this.getStreamRole($1)?.role!==`follower`)return;'
+    );
+    const emit = patched.match(/threadStreamStateChanged\([\w$]+\)\{([\w$]+)\(`thread-stream-state-changed`,[\w$]+\)\}/)?.[1];
+    if (!emit) return patched;
+    // 通过事件函数定位其 Map，避免按压缩变量名或任意 new Map 猜测补丁位置。
+    const escapedEmit = emit.replace(/\$/g, "\\$");
+    const dispatcher = patched.match(new RegExp(`function ${escapedEmit}\\([\\w$]+,[\\w$]+\\)\\{let [\\w$]+=([\\w$]+)\\.get\\(`));
+    if (!dispatcher) return patched;
+    // 等到官方注册 stream listener 再重放，否则模块初始化早于 manager 创建，会丢掉首个 snapshot。
+    const registry = dispatcher[1];
+    const escapedRegistry = registry.replace(/\$/g, "\\$");
+    patched = patched.replace(
+      new RegExp(`function ([\\w$]+)\\(([\\w$]+),([\\w$]+)\\)\\{let ([\\w$]+)=${escapedRegistry}\\.get\\(\\2\\);([\\s\\S]{0,200}?)return \\4\\.add\\(([\\w$]+)\\),`),
+      '$&queueMicrotask(()=>window.__opencodexCoordinationListenerReady?.($2)),'
+    );
+    // 保持原变量声明语法，待模块完成初始化后再重放首屏状态，避免 Map 尚未赋值。
+    return patched.replace(`${registry}=new Map`, `${registry}=(queueMicrotask(()=>window.__opencodexInstallCoordinationDispatcher?.(${emit},channel=>(${registry}.get(channel)?.size||0)>0)),new Map)`);
+  }
+
+  /** 同一账号的资料查询读取本机展示身份，缺失时仍走官方 /me 接口。 */
+  function patchAccountProfile(source) {
+    // 官方 query-seed 包装器会覆盖 initialData；在实际 queryFn 中按官方 queryKey 校验账号。
+    let patched = source.replace(
+      /(queryKey:[\w$]+\(\{accountId:[\w$]+,userId:[\w$]+\}\),queryFn:async\(\{signal:)([\w$]+)(\}\)=>)([\w$]+\.parse\(await [\w$]+\.safeGet\(`\/me`,\{signal:\2\}\)\))/g,
+      "$1$2,queryKey:opencodexProfileKey$3window.__opencodexAccountProfile?.(opencodexProfileKey[2],opencodexProfileKey[1])??$4"
+    );
+    // 基础身份已有数据时无需等待可选公开资料和账号设置，后续资料仍可按原请求更新。
+    const profileQuery = patched.match(/([\w$]+)=ji\([\w$]+,\(\{accountId:[\w$]+,userId:[\w$]+\}\)=>\(\{[^;]{0,500}opencodexProfileKey/);
+    if (!profileQuery) return patched;
+    const escapedQuery = profileQuery[1].replace(/\$/g, "\\$");
+    const binding = patched.match(new RegExp(`let\\{data:([\\w$]+),isPending:([\\w$]+)\\}=[\\w$]+\\(${escapedQuery},[\\w$]+\\)`));
+    if (!binding) return patched;
+    const escapedPending = binding[2].replace(/\$/g, "\\$");
+    return patched.replace(new RegExp(`=(${escapedPending}\\|\\|[\\w$]+&&\\([\\w$]+\\|\\|[\\w$]+\\))`), `=${binding[1]}==null&&($1)`);
+  }
+
   function officialAssetHasPatchCandidate(reqPath, data, req) {
     const loopback = isLoopbackHostHeader(req && req.headers && req.headers.host);
     return (
       /\/app-server-manager-signals-[^/]+\.js$/.test(reqPath) ||
       data.includes(APPLICATION_MENU_TOKEN) ||
       data.includes(APP_SERVER_REQUEST_CLIENT_DISPATCH_ERROR) ||
+      data.includes("/wham/statsig/bootstrap") ||
+      data.includes("threadStreamStateChanged(") ||
+      data.includes(".safeGet(`/me`,") ||
       (!loopback &&
         (data.includes(OPEN_IN_FOLDER_LOCALE_TOKEN) ||
           (data.includes("composerIconPath") && data.includes("read-file-binary"))))
@@ -1538,6 +1609,11 @@ ${pluginGatewayStateBootstrapScript()}
       : source;
     patched = patchApplicationMenuCompatible(patched);
     patched = patchRequestSchedulingCompatible(patched);
+    // 将新版 AppHost 初始化接回已有 Web Provider，避免启动阶段请求无法被本地处理。
+    patched = patchStatsigBootstrapCompatible(patched);
+    // 新版 AppHost 不再消费旧侧栏 IPC；将状态同步和资料首屏交回官方 renderer 的原有状态机。
+    patched = patchLiveSidebarStateCompatible(patched);
+    patched = patchAccountProfileCompatible(patched);
     if (!loopback) {
       patched = patchPluginImageCompatible(patched);
       patched = patchOpenInFolderLocaleCompatible(patched, options.downloadMessage || downloadFileMessage());
@@ -1575,10 +1651,10 @@ ${pluginGatewayStateBootstrapScript()}
   }
 
   /** 静态资源缓存策略：hash asset 长缓存，入口 HTML/no-store 保持可更新。 */
-  function cacheControlForRequestPath(reqPath, responsePatched = false) {
+  function cacheControlForRequestPath(reqPath, responsePatched = false, responseData = null) {
     if (process.env.CODEX_WEB_DISABLE_ASSET_CACHE === "1") return "no-store";
     if (patchedOfficialAssetName(reqPath)) {
-      if (responsePatched) {
+      if (responsePatched && (!responseData || responseData.includes(OPEN_IN_FOLDER_LOCALE_TOKEN))) {
         // 动态 patch 仍要求每次校验，但允许浏览器保存响应并通过 ETag 复用，避免旧版本长期驻留。
         return "private, no-cache, must-revalidate";
       }
@@ -1588,11 +1664,14 @@ ${pluginGatewayStateBootstrapScript()}
        */
       if (
         reqPath.startsWith(PATCHED_OFFICIAL_PREFIX) &&
-        /-[A-Za-z0-9_-]{8}\.(?:avif|css|gif|ico|jpe?g|js|png|svg|webp|woff2?)$/i.test(
+        // 新版 Rolldown 产物使用 12 位十六进制哈希；旧版 Vite 的 8 位哈希继续兼容。
+        /-(?:[A-Za-z0-9_-]{8}|[a-f0-9]{12})\.(?:avif|css|gif|ico|jpe?g|js|png|svg|webp|woff2?)$/i.test(
           patchedOfficialAssetName(reqPath)
         )
       ) {
-        return "public, max-age=31536000, immutable";
+        // 菜单、调度和 Statsig 的转换只由版本化代码决定；无需每次刷新再传输整份主包。
+        // 含主机语言文案的资源在上方继续逐次校验，静态补丁仅保存在当前浏览器的私有缓存。
+        return responsePatched ? "private, max-age=31536000, immutable" : "public, max-age=31536000, immutable";
       }
       // 旧前缀没有可靠版本位，只用于兼容浏览器残留的懒加载请求。
       return "no-store";
@@ -1624,7 +1703,7 @@ ${pluginGatewayStateBootstrapScript()}
         const sendRepresentation = (representation) => {
           const headers = {
             "content-type": contentType,
-            "cache-control": cacheControlForRequestPath(reqPath, entry.patched),
+            "cache-control": cacheControlForRequestPath(reqPath, entry.patched, entry.data),
             etag: representation.etag,
             vary: "Accept-Encoding",
           };
@@ -1697,7 +1776,7 @@ ${pluginGatewayStateBootstrapScript()}
       req,
       {
         "content-type": mimeType(file),
-        "cache-control": cacheControlForRequestPath(reqPath, data !== sourceData),
+        "cache-control": cacheControlForRequestPath(reqPath, data !== sourceData, data),
         ...(sourceEtag ? { etag: sourceEtag, vary: "Accept-Encoding" } : {}),
       },
       data
@@ -1778,21 +1857,43 @@ ${pluginGatewayStateBootstrapScript()}
       runtimeBootstrapRepresentation({ headers: { "accept-encoding": "br,gzip" } }, bootstrapEntry);
       runtimeBootstrapRepresentation({ headers: { "accept-encoding": "gzip" } }, bootstrapEntry);
     }
-    const mainFileName = officialAssetFileNames()
-      .filter((fileName) => /^app-initial-[A-Za-z0-9_-]+\.js$/.test(fileName))
-      .sort()[0];
-    if (!mainFileName) return;
-    const reqPath = `${PATCHED_OFFICIAL_PREFIX}assets/${mainFileName}`;
-    const file = locateOfficialAsset(`assets/${mainFileName}`);
-    if (!file) return;
-    // 本机调试与远程浏览器的主包 patch 可能不同；同时准备 HTTPS/Brotli 与 HTTP/gzip 两条传输路径。
-    await Promise.all(
-      ["127.0.0.1", "opencodex.remote"].map(async (host) => {
-        const req = { headers: { "accept-encoding": "br,gzip", host } };
-        const entry = await cachedPatchedAsset(reqPath, file, req);
-        await Promise.all([cachedRepresentation(entry, "br"), cachedRepresentation(entry, "gzip")]);
-      })
-    );
+    // 仅准备当前启动所需的入口、共享资源和宿主语言包，避免首次中继访问串行等待补丁与压缩。
+    const locale = currentHostI18n().locale;
+    // 使用当前官方缓存的文件索引选择启动 chunk，保留原有版本切换规则。
+    const fileNames = officialAssetFileNames();
+    const startupFileNames = new Set();
+    for (const fileName of fileNames) {
+      if (/^app-(?:initial|shared)-[A-Za-z0-9_-]+\.(?:js|css)$/.test(fileName)
+          || (locale && fileName.startsWith(`${locale}-`) && fileName.endsWith(".js"))) {
+        startupFileNames.add(fileName);
+      }
+    }
+    // 官方入口和 preload 依构建变化，以当前 HTML 引用为准，不预热其他页面的懒加载 chunk。
+    const index = locateOfficialIndex();
+    if (index) {
+      // 读取当前版本的入口引用，补齐实际使用的模块入口及依赖样式。
+      const html = readText(index.file);
+      for (const match of html.matchAll(/<(?:script|link)\b[^>]*\b(?:src|href)=["'](?:\.\/|\/official\/)?assets\/([A-Za-z0-9_.-]+\.(?:js|css))["']/gi)) {
+        startupFileNames.add(match[1]);
+      }
+    }
+    // 逐个资源预热，复用既有内存预算及淘汰规则，避免大包同时构建增加启动峰值内存。
+    for (const fileName of startupFileNames) {
+      const reqPath = `${PATCHED_OFFICIAL_PREFIX}assets/${fileName}`;
+      // 资源定位仍校验官方目录边界；缓存切换时缺失的文件直接跳过。
+      const file = locateOfficialAsset(`assets/${fileName}`);
+      if (!file) continue;
+      // 本机调试与远程浏览器的主包 patch 可能不同；同时准备 HTTPS/Brotli 与 HTTP/gzip 两条传输路径。
+      await Promise.all(
+        ["127.0.0.1", "opencodex.remote"].map(async (host) => {
+          const req = { headers: { "accept-encoding": "br,gzip", host } };
+          // 构建当前主机类型的补丁表示，使后续真实请求复用同一个缓存键。
+          const entry = await cachedPatchedAsset(reqPath, file, req);
+          // 提前准备两种浏览器传输编码，沿用缓存容量及压缩质量。
+          await Promise.all([cachedRepresentation(entry, "br"), cachedRepresentation(entry, "gzip")]);
+        })
+      );
+    }
   }
 
   function servePluginLoader(res) {

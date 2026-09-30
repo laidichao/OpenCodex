@@ -7,6 +7,10 @@
 // 一切来自 main.cjs 的函数（saveLauncherSettings / readAuthEnabled / appendLog 等）
 // 都通过 createRelayCore(deps) 传入；纯函数（normalize 系列 / URL 拼接）在模块级直接导出。
 
+// 显式使用 Node.js 系统模块，避免 Electron 的全局 Web Crypto 被误当作设备 ID 随机源。
+const crypto = require("node:crypto");
+const os = require("node:os");
+
 // ---------- 纯函数（无外部依赖） ----------
 
 // 与 main.cjs 的 normalizeHostMode 语义保持一致（upstream 原有函数，这里独立副本避免反向依赖）。
@@ -45,7 +49,7 @@ function normalizeRelayPort(value) {
 }
 
 // 自定义访问后缀：小写字母/数字开头，允许小写字母、数字、中划线、下划线，长度 2-32。
-// 留空表示使用本机 MAC 设备 ID。设备页地址 = https://<vps>:<port>/d/<后缀或设备ID>/
+// 留空表示使用首次生成并保存的随机设备 ID。设备页地址 = https://<vps>:<port>/d/<后缀或设备ID>/
 function normalizeRelayPath(value) {
   const text = String(value || "")
     .trim()
@@ -82,44 +86,6 @@ function normalizeRelayFields(source) {
   };
 }
 
-// 取本机物理网卡 MAC：跳过回环、全零与常见虚拟网卡（Hyper-V/VMware/VirtualBox/随机 MAC）。
-function primaryMacAddress() {
-  const virtualPrefixes = [
-    "00:15:5d", // Hyper-V
-    "00:05:69", "00:0c:29", "00:1c:14", // VMware
-    "08:00:27", "0a:00:27", // VirtualBox
-    "00:50:56", "00:1c:42", // VMware/VirtualBox 其他段
-    "02:00:4c", "02:42:ac", // Microsoft/容器随机 MAC
-  ];
-  const isUsable = (item) =>
-    item &&
-    !item.internal &&
-    item.mac &&
-    !/^0{2}(:0{2}){5}$/.test(item.mac) &&
-    !virtualPrefixes.some((prefix) => item.mac.toLowerCase().startsWith(prefix));
-  try {
-    const interfaces = os.networkInterfaces();
-    // 名称排序保证多网卡机器上取值稳定，不随枚举顺序漂移。
-    for (const name of Object.keys(interfaces).sort()) {
-      for (const item of interfaces[name] || []) {
-        if (isUsable(item) && (item.family === "IPv4" || item.family === 4)) return item.mac;
-      }
-    }
-    for (const list of Object.values(interfaces)) {
-      for (const item of list || []) {
-        if (isUsable(item)) return item.mac;
-      }
-    }
-  } catch {}
-  return "";
-}
-
-// 设备 ID 直接来自本机 MAC（pc- + 12 位 hex），跨重启稳定；无可用 MAC 时才退回随机。
-function macDeviceId() {
-  const mac = primaryMacAddress().replace(/:/g, "").toLowerCase();
-  return mac ? `pc-${mac}` : `pc-${crypto.randomBytes(6).toString("hex")}`;
-}
-
 // 服务器模式顶部访问地址：VPS 统一入口里本机设备的页面。
 // 有自定义访问后缀时优先用后缀（反连注册也用同一 ID，保证地址真实可达）。
 // 返回 null 表示非服务器模式或信息不全，调用方回退原有 LAN/local 逻辑。
@@ -149,13 +115,14 @@ function createRelayCore(deps) {
   const { saveLauncherSettings } = deps;
 
   // 设备 ID 与本机名称支持零配置：首次切到服务器模式时自动生成并持久化。
-  // 设备 ID 一律取本机 MAC；旧的 6 位随机格式（早期版本）也会被 MAC 值平滑替换。
+  // 首次生成随机码并保存，后续启动保留原 ID，避免设备访问地址漂移。
   // 返回值可能经过 saveLauncherSettings 落盘，与原 main.cjs 内嵌版本行为一致。
   function ensureRelayIdentity(paths, settings) {
     const merged = { ...settings };
     let dirty = false;
-    if (!normalizeRelayString(merged.relayDeviceId) || /^pc-[0-9a-f]{6}$/.test(merged.relayDeviceId)) {
-      merged.relayDeviceId = macDeviceId();
+    if (!normalizeRelayString(merged.relayDeviceId)) {
+      // 地址不包含网卡、主机名或开发者身份。
+      merged.relayDeviceId = crypto.randomBytes(8).toString("hex");
       dirty = true;
     }
     if (!normalizeRelayString(merged.relayDeviceName)) {
@@ -183,7 +150,7 @@ function createRelayCore(deps) {
       env.OCX_RELAY_URL = `wss://${relayHost}:${normalizeRelayPort(relay.relayPort)}/openCodeProxy`;
       if (relay.relaySecret) env.OCX_RELAY_SECRET = relay.relaySecret;
       // 反连注册 ID：有自定义访问后缀时用它（与顶部访问地址 /d/<后缀>/ 保持一致），
-      // 服务端会自动把登记条目 re-bind 到该 ID；否则用本机 MAC 设备 ID。
+      // 服务端会自动把登记条目 re-bind 到该 ID；否则用已保存的随机设备 ID。
       const registerId = relayCustomPath || normalizeRelayString(relay.relayDeviceId);
       if (registerId) env.OCX_RELAY_DEVICE_ID = registerId;
       if (relay.relayDeviceName) env.OCX_RELAY_DEVICE_NAME = relay.relayDeviceName;
@@ -213,9 +180,13 @@ function createRelayCore(deps) {
       const paths = runtimePaths();
       ensureRuntimeLayout(paths);
       gatewayState.paths = paths;
+      // 保存表单只覆盖可编辑连接项，设备身份从当前持久化设置取得。
+      const currentSettings = gatewayState.settings || loadLauncherSettings(paths);
       const merged = {
-        ...(gatewayState.settings || loadLauncherSettings(paths)),
+        ...currentSettings,
         ...normalizeRelayFields(relayInput),
+        // UI 不提交设备码；保存面板时沿用已持久化的身份，且不允许 IPC 替换它。
+        relayDeviceId: normalizeRelayString(currentSettings.relayDeviceId),
         // 显式覆盖：IPC 入参的布尔必须精确 true/false，不吞 undefined。
         relayTlsInsecure: relayInput.relayTlsInsecure === true,
       };
@@ -227,7 +198,7 @@ function createRelayCore(deps) {
       ) {
         throw new Error("服务器模式必须先设置访问密码（设置区的「访问密码」），再保存中继配置");
       }
-      // 设备 ID 不接受外部传入：统一由 ensureRelayIdentity 按本机 MAC 生成。
+      // 设备 ID 不接受外部传入：缺失时由 ensureRelayIdentity 生成随机码。
       // 必须先把用户保存的中继配置显式落盘：ensureRelayIdentity 只在需要补身份字段
       // （dirty=true）时才写文件；设备 ID/名称已存在时它不会保存，若不在前面显式落盘，
       // restartGateway 会从磁盘读回旧配置覆盖内存态，表现为「保存即清空」。

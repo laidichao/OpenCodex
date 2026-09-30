@@ -21,7 +21,9 @@ const COMPOSER_SOURCE = fs.readFileSync(
   "utf8"
 );
 const TOOLTIP_SOURCE = fs.readFileSync(path.join(INTERNAL_PROVIDER_DIR, "codex-tooltip-dismiss-guard.js"), "utf8");
-const BRIDGE_SOURCE = fs.readFileSync(path.join(INTERNAL_PROVIDER_DIR, "codex-bridge-polyfill.js"), "utf8");
+// Windows checkout 的 CRLF 不应影响 Statsig 函数片段的定位与行为验证。
+const bridgeSourceText = fs.readFileSync(path.join(INTERNAL_PROVIDER_DIR, "codex-bridge-polyfill.js"), "utf8");
+const BRIDGE_SOURCE = bridgeSourceText.replace(/\r\n/g, "\n");
 const SIDEBAR_PREVIEW_SOURCE = fs.readFileSync(
   path.join(INTERNAL_PROVIDER_DIR, "codex-sidebar-preview.js"),
   "utf8"
@@ -56,6 +58,8 @@ const TOKEN_USAGE_CAPABILITY_SOURCE = fs.readFileSync(
 );
 
 function sourceSection(source, startMarker, endMarker) {
+  // 源码片段按逻辑换行定位，Windows checkout 的 CRLF 不改变待验证代码。
+  source = source.replace(/\r\n/g, "\n");
   const start = source.indexOf(startMarker);
   const end = source.indexOf(endMarker, start + startMarker.length);
   assert.notEqual(start, -1, `missing source marker: ${startMarker}`);

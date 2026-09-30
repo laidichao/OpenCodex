@@ -609,7 +609,7 @@ async function ensurePortSetting(paths, settings) {
   });
 }
 
-// [OCX-FORK] primaryMacAddress / macDeviceId / ensureRelayIdentity 已迁至
+// [OCX-FORK] ensureRelayIdentity 已迁至
 // launcher/fork/relay-core.cjs（createRelayCore 闭包内，saveLauncherSettings 走依赖注入）。
 
 function officialBundleCache() {

@@ -141,7 +141,6 @@ function renderHostMode(hostMode) {
 // [OCX-FORK] 服务器中继面板渲染（upstream 无此函数；配套 DOM 见 index.html 的 relayPanel）。
 function renderRelay(settings, authEnabled) {
   // 用户正在面板里编辑时跳过回填：launcher 会高频推送状态，回填会清掉未保存的输入。
-  console.log(`[relay-debug] renderRelay editing=${relayEditing}`);
   if (relayEditing) return;
   const relay = settings || {};
   const setVal = (id, v) => {
@@ -153,10 +152,8 @@ function renderRelay(settings, authEnabled) {
   setVal("relayCustomPathInput", relay.relayCustomPath || "");
   const deviceIdText = $("relayDeviceIdText");
   if (deviceIdText) {
-    // 纯 MAC 展示：relayDeviceId 形如 pc-7c10c93c2e0a，剥掉 pc- 前缀只留 12 位 MAC。
-    // 只读输入框（readonly）与相邻输入组件风格一致，无值时靠 placeholder 显示占位。
-    const rawId = String(relay.relayDeviceId || "");
-    deviceIdText.value = /^pc-[0-9a-f]{12}$/.test(rawId) ? rawId.slice(3) : rawId;
+    // 展示完整随机设备码，与实际默认访问后缀保持一致。
+    deviceIdText.value = String(relay.relayDeviceId || "");
   }
   setVal("relayDeviceNameInput", relay.relayDeviceName || "");
   setVal("relaySecretInput", relay.relaySecret || "");
@@ -374,9 +371,6 @@ document.addEventListener("click", async (event) => {
       return node ? node.value : "";
     };
     const tls = $("relayTlsInsecureInput");
-    console.log(
-      `[relay-debug] saveRelay clicked host=${collect("relayHostInput")} port=${collect("relayPortInput")} secret=${collect("relaySecretInput") ? "<set>" : "<empty>"} tls=${!!(tls && tls.checked)} path=${collect("relayCustomPathInput")}`
-    );
     // 保存成功后解除编辑态，用保存结果（含自动生成的设备 ID）回填面板。
     relayEditing = false;
     const errNode = $("relayErrorText");
@@ -433,7 +427,6 @@ document.addEventListener("focusin", (event) => {
   // 点进中继面板任意输入框即视为编辑开始，直到保存或切换模式才恢复回填。
   const target = event.target;
   if (target && typeof target.closest === "function" && target.closest("#relayPanel")) {
-    console.log(`[relay-debug] focusin id=${target.id || target.tagName}`);
     relayEditing = true;
   }
 });

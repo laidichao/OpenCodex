@@ -384,7 +384,8 @@ function createOfficialLiveObserver(options = {}) {
   }
 
   function observeSidebarBootstrap(bootstrap) {
-    const entries = bootstrap?.catalogSnapshot?.entries;
+    // 新版官方启动快照直接提供 catalogEntries，旧版仍包装在 catalogSnapshot 中。
+    const entries = Array.isArray(bootstrap?.catalogEntries) ? bootstrap.catalogEntries : bootstrap?.catalogSnapshot?.entries;
     if (!Array.isArray(entries)) return 0;
     let observed = 0;
     const visibleThreads = new Set();
