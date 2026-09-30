@@ -4,9 +4,8 @@
 //   - PC 端 OpenCodex 内嵌反连客户端，主动出站 WSS 连到本进程 /openCodeProxy，把本机
 //     gateway 的整个 HTTP+WS 能力反推上来。PC 侧零入站端口、零穿透客户端、零公网暴露。
 //   - 浏览器访问服务器看到设备看板；进入 /d/<accessPath>/ 即该设备的 Codex Desktop UI。
-//   - 设备 UI 的 HTML 使用根绝对路径引用资源（/official-patched-v8/...、/codex-web-config.js）
-//     与运行时 API（/api/*、/backend-api/*），因此除看板自身固定路由外，所有根路径请求都按
-//     「设备 cookie（ocx_device）」反代到对应设备——这是设备页能完整加载的关键。
+//   - 设备页的启动资源和运行时请求固定带 /d/<accessPath>/，登录 Cookie 按设备命名。
+//     旧页面的根路径请求仍兼容设备 Cookie，但新页面不依赖全浏览器共享的设备选择。
 //   - 设备（PC）侧鉴权：每设备一密 secret，/openCodeProxy 升级后 register 帧校验（密钥值匹配 + re-bind）。
 //   - 浏览器侧鉴权：账号密码登录（默认 admin/admin，首次登录强制改密）+ HttpOnly 会话 cookie。
 //     账号数据以 AES-256-GCM 加密存 JSON（auth.json），主密钥独立存放（.auth.key）。
@@ -272,6 +271,61 @@ function resolveProxyDevice(req) {
   if (cookieDevice && deviceOnline(cookieDevice)) return devices.get(cookieDevice);
   const online = [...devices.values()].filter((d) => d.online && d.socket && d.socket.readyState === 1);
   return online.length === 1 ? online[0] : null;
+}
+
+function gatewayCookieForDevice(req, dev) {
+  const cookies = parseCookies(req);
+  // 只接受本设备登录态，旧的共享 Cookie 需重新登录，避免退出后又回落到旧凭证。
+  return cookies[`${GATEWAY_AUTH_COOKIE}_${dev.accessPath}`] || "";
+}
+
+function rewriteGatewayCookies(headers, dev) {
+  const value = headers["set-cookie"];
+  if (!value) return;
+  const cookies = Array.isArray(value) ? value : [value];
+  // 保留 HttpOnly、SameSite、过期及删除语义，仅隔离 Gateway Cookie 的名字和路径。
+  headers["set-cookie"] = cookies.map((cookie) => String(cookie).replace(
+    new RegExp(`^${GATEWAY_AUTH_COOKIE}=`), `${GATEWAY_AUTH_COOKIE}_${dev.accessPath}=`
+  ).replace(/;\s*Path=\/api\/auth(?=;|$)/i, "; Path=/"));
+}
+
+function deviceScopeBootstrap() {
+  // 在应用脚本和密码页脚本之前固定本页设备，其他标签页修改 Cookie 不会改变请求归属。
+  const scriptUrl = new URL(document.currentScript.src);
+  const prefix = scriptUrl.pathname.slice(0, scriptUrl.pathname.lastIndexOf("/"));
+  function scopedUrl(value) {
+    const url = new URL(value, document.baseURI);
+    if (url.origin !== location.origin || url.pathname.startsWith("/d/")) return url.href;
+    url.pathname = prefix + url.pathname;
+    return url.href;
+  }
+  const originalFetch = window.fetch;
+  window.fetch = function (input, options) {
+    // Request 对象保留正文、请求头和取消信号；外部 API 与已指定设备的 URL 原样使用。
+    if (input instanceof Request) {
+      const url = scopedUrl(input.url);
+      return originalFetch.call(this, url === input.url ? input : new Request(url, input), options);
+    }
+    return originalFetch.call(this, scopedUrl(String(input)), options);
+  };
+  const originalOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url, ...options) {
+    // 旧依赖的 XHR 与 fetch 使用相同设备路由，参数及同步/异步选项保持原样。
+    return originalOpen.call(this, method, scopedUrl(String(url)), ...options);
+  };
+}
+
+function rewriteDeviceHtml(buf, accessPath) {
+  const prefix = `/d/${accessPath}`;
+  let html = buf.toString("utf8");
+  // 初始脚本、样式和预载资源也必须隔离；相对模块导入会自然沿用此设备前缀。
+  html = html.replace(/((?:src|href)=["'])\/(?!\/|d\/)([^"']*)(["'])/g,
+    (match, start, resource, end) => `${start}${prefix}/${resource}${end}`);
+  const bootstrap = `<script src="${prefix}/opencodex-device-scope.js"></script>`;
+  // 外部同源脚本遵守页面 CSP，不增加 unsafe-inline；密码页也在首个 fetch 前安装。
+  return Buffer.from(/<head\b[^>]*>/i.test(html)
+    ? html.replace(/<head\b[^>]*>/i, `$&${bootstrap}`)
+    : bootstrap + html, "utf8");
 }
 
 // ---------- 页面：登录 / 改密 / 看板 ----------
@@ -608,13 +662,13 @@ function proxyHttpRequest(req, res, parsed, { bindDeviceCookie = false } = {}) {
   // 只剥离中继管理员会话；Gateway 自己的登录 Cookie 必须到达设备端执行访问密码校验。
   delete headers["authorization"];
   delete headers["cookie"];
-  const gatewayCookie = parseCookies(req)[GATEWAY_AUTH_COOKIE];
+  const gatewayCookie = gatewayCookieForDevice(req, dev);
   if (gatewayCookie) headers.cookie = `${GATEWAY_AUTH_COOKIE}=${encodeURIComponent(gatewayCookie)}`;
 
   const fwdHeaders = {};
   for (const [k, v] of Object.entries(headers)) fwdHeaders[k] = v;
 
-  // config.js 需要整包重写 gatewayWsUrl，标记后缓冲；其余响应流式转发。
+  // 配置脚本和设备 HTML 需重写设备前缀；其余响应继续流式转发。
   const stream = {
     role: "http",
     res,
@@ -660,6 +714,13 @@ function handleProxyFrame(dev, msg) {
     if (!s || s.role !== "http") return;
     s._status = msg.status;
     s._headers = msg.headers || {};
+    // 登录、续期和退出登录都改写为本设备 Cookie，避免两个设备互相覆盖认证。
+    rewriteGatewayCookies(s._headers, dev);
+    // 下载文件及带 sandbox 的预览保持原正文，作用域脚本只安装到设备应用页面。
+    if (/\btext\/html\b/i.test(s._headers["content-type"] || "") &&
+        !s._headers["content-disposition"] && !/\bsandbox\b/i.test(s._headers["content-security-policy"] || "")) {
+      s._html = s._rewrite = true;
+    }
     // 设备页访问时绑定设备 cookie：之后该浏览器的根路径资源请求都反代到这台设备。
     if (s._setCookie) {
       const existing = s._headers["set-cookie"];
@@ -702,9 +763,8 @@ function handleProxyFrame(dev, msg) {
           if (encoding === "gzip") body = zlib.gunzipSync(body);
           else if (encoding === "br") body = zlib.brotliDecompressSync(body);
           else if (encoding === "deflate") body = zlib.inflateSync(body);
-          // 只改变中继 WebSocket 地址，继续保留 Gateway 的语言、插件和认证配置。
-          // 浏览器实时连接使用访问后缀，不能暴露或依赖内部设备 MAC。
-          out = rewriteConfigWsUrl(body, dev.accessPath);
+          // 页面资源和配置都固定访问后缀，保留设备语言、插件及认证配置，不使用内部 MAC。
+          out = s._html ? rewriteDeviceHtml(body, dev.accessPath) : rewriteConfigWsUrl(body, dev.accessPath);
           s._headers = { ...s._headers };
           delete s._headers["content-encoding"];
           // 已缓冲的改写响应使用最终长度，不能同时保留设备端的分块传输头。
@@ -743,6 +803,8 @@ function handleProxyFrame(dev, msg) {
 // config.js 重写：实时连接与 HTTP 页面共用独立访问后缀。
 function rewriteConfigWsUrl(buf, accessPath) {
   let text = buf.toString("utf8");
+  // HTTP 与 WebSocket 同时固定设备，不能只隔离实时连接而让 API 依赖共享 Cookie。
+  text = text.replace(/(gatewayBaseUrl:\s*location\.origin)/, `$1 + "/d/${accessPath}"`);
   text = text.replace(/(\.replace\(\/\^http\/,\s*"ws"\))\s*\+\s*"\/ws"/, `$1 + "/d/${accessPath}/ws"`);
   return Buffer.from(text, "utf8");
 }
@@ -879,6 +941,11 @@ let server = (tlsOpts ? https.createServer(tlsOpts) : http.createServer()).on(
         if (session.mustChange) {
           res.writeHead(302, { location: "/change-password" });
           return res.end();
+        }
+        if (parsed.deviceId && parsed.rest === "/opencodex-device-scope.js") {
+          // 作用域脚本由中继提供，设备 Gateway 无需新增入口；禁用缓存便于修复即时生效。
+          res.writeHead(200, { "content-type": "application/javascript; charset=utf-8", "cache-control": "no-store" });
+          return res.end(`(${deviceScopeBootstrap.toString()})();`);
         }
         return proxyHttpRequest(req, res, parsed, { bindDeviceCookie: true });
       }
@@ -1131,7 +1198,7 @@ browserWss.on("connection", (bws, req) => {
   const stream = { role: "ws", browserWs: bws };
   dev.streams.set(streamId, stream);
   // WebSocket 只转发 Gateway 登录态，使实时连接继续执行与 HTTP 相同的访问密码校验。
-  const gatewayCookie = parseCookies(req)[GATEWAY_AUTH_COOKIE];
+  const gatewayCookie = gatewayCookieForDevice(req, dev);
   const headers = gatewayCookie ? { cookie: `${GATEWAY_AUTH_COOKIE}=${encodeURIComponent(gatewayCookie)}` } : {};
   dev.socket.send(JSON.stringify({ t: "ws-open", id: streamId, path: parsed.rest || "/ws", headers }));
   const b64 = (buf) => Buffer.from(buf).toString("base64");
