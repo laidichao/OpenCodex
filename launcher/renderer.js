@@ -157,8 +157,9 @@ function renderRelay(settings, authEnabled) {
   }
   setVal("relayDeviceNameInput", relay.relayDeviceName || "");
   setVal("relaySecretInput", relay.relaySecret || "");
-  const tls = $("relayTlsInsecureInput");
-  if (tls) tls.checked = !!relay.relayTlsInsecure;
+  const httpsToggle = $("relayUseHttpsInput");
+  // 仅明确开启 HTTPS 时勾选，缺省使用 HTTP。
+  if (httpsToggle) httpsToggle.checked = relay.relayUseHttps === true;
   // 服务器模式下未设置访问密码时提前提示（保存时主进程也会硬性拦截）。
   const errNode = $("relayErrorText");
   if (errNode) {
@@ -370,7 +371,7 @@ document.addEventListener("click", async (event) => {
       const node = $(id);
       return node ? node.value : "";
     };
-    const tls = $("relayTlsInsecureInput");
+    const httpsToggle = $("relayUseHttpsInput");
     // 保存成功后解除编辑态，用保存结果（含自动生成的设备 ID）回填面板。
     relayEditing = false;
     const errNode = $("relayErrorText");
@@ -382,7 +383,7 @@ document.addEventListener("click", async (event) => {
           relayDeviceName: collect("relayDeviceNameInput"),
           relayCustomPath: collect("relayCustomPathInput"),
           relaySecret: collect("relaySecretInput"),
-          relayTlsInsecure: !!(tls && tls.checked),
+          relayUseHttps: !!(httpsToggle && httpsToggle.checked),
         })
       );
       if (errNode) errNode.hidden = true;

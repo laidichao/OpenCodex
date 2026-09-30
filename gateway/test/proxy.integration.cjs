@@ -1,4 +1,4 @@
-// test-harness.cjs —— openCodeProxy 本地端到端验证
+// proxy.integration.cjs —— openCodeProxy 本地端到端验证
 // 1) 启动 mock gateway(:3737) 模拟 OpenCodex 本机 gateway（含 /codex-web-config.js、/ws echo、/api/health）
 // 2) 启动真实 openCodeProxy(server.js, :8080)：账号登录（admin/admin 首登强制改密）+ 加密 auth.json
 // 3) 用真实 PC 端 reverse-tunnel-client 反连，把 :3737 推到代理
@@ -69,7 +69,7 @@ function gatewayAuthSource(req) {
 })();
 
 // --- openCodeProxy 服务端 ---
-require("./server.js");
+require("../../proxy/server.js");
 
 // --- mock gateway :3737 ---
 const mock = http.createServer((req, res) => {
@@ -155,7 +155,7 @@ process.env.OCX_RELAY_URL = "ws://127.0.0.1:8080/openCodeProxy";
 process.env.OCX_RELAY_SECRET = "testsecret";
 process.env.OCX_RELAY_DEVICE_ID = "mock";
 process.env.OCX_RELAY_DEVICE_NAME = "MockPC";
-const { startReverseTunnel } = require("../gateway/runtime/relay/reverse-tunnel-client.cjs");
+const { startReverseTunnel } = require("../runtime/relay/reverse-tunnel-client.cjs");
 startReverseTunnel({
   diagnosticLog: () => {},
   diagnosticWarn: (c, m, o) => console.log("[relay-warn]", m, o || ""),

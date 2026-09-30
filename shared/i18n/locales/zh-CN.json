@@ -151,6 +151,6 @@
   "launcher.settings.relay.deviceNamePlaceholder": "留空用计算机名",
   "launcher.settings.relay.secret": "设备密钥",
   "launcher.settings.relay.secretPlaceholder": "在服务器看板「添加设备」生成后粘贴",
-  "launcher.settings.relay.tlsInsecure": "跳过 TLS 证书校验",
-  "launcher.settings.relay.tlsInsecureLabel": "跳过 TLS 证书校验（自签证书时使用）"
+  "launcher.settings.relay.useHttps": "使用 HTTPS",
+  "launcher.settings.relay.useHttpsLabel": "使用 HTTPS"
 }

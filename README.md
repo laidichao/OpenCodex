@@ -141,14 +141,15 @@ OpenCodex本身不提供远程访问服务，如果需要在其他设备中远�
 **VPS 侧部署**（Node.js 单文件 + `ws` 依赖，无需数据库）：
 
 ```bash
-# 最简试跑（生产部署见文档：TLS 证书 + systemd 常驻）
-mkdir -p /opt/proxy && cp proxy/server.js proxy/package.json /opt/proxy/
-cd /opt/proxy && npm install --omit=dev && node server.js
+# 以 root 执行，下载后自动打开中文管理菜单
+curl -fsSL https://raw.githubusercontent.com/laidichao/OpenCodex/main/proxy/deploy.sh -o /tmp/opencodex-deploy.sh && bash /tmp/opencodex-deploy.sh
 ```
 
-👉 **完整部署文档见 [proxy/README.md](proxy/README.md)**（含 VPS 环境准备、TLS 证书、systemd 常驻、看板账号与设备密钥管理、安全清单）。
+运行后按编号选择安装、启动、停止、重启、更新、状态、日志或修改端口；安装和修改端口时会提示输入端口，占用自动顺延。操作后返回菜单，选择 `0` 退出，选择 `9` 查看完整帮助。普通用户请使用 `sudo bash`。脚本发布到仓库后即可下载使用。
 
-PC 侧无需任何额外工具：桌面启动器 → 启动地址选「服务器」→ 填 VPS 地址与设备密钥（看板「添加设备」生成）→ 保存即可。
+👉 **完整部署文档见 [中继服务部署指南](docs/PROXY_DEPLOYMENT.md)**（含一键安装/更新/重启、HTTP 默认部署、可选 HTTPS、看板账号与设备密钥管理）。
+
+PC 侧无需任何额外工具：桌面启动器 → 启动地址选「服务器」→ 填 VPS 地址与设备密钥（看板「添加设备」生成）→ 默认使用 HTTP，需要 HTTPS 时勾选「使用 HTTPS」→ 保存即可。
 <!-- [OCX-FORK] END 服务器中继部署说明 -->
 
 ## 常用环境变量

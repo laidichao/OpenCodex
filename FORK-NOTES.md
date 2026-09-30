@@ -22,9 +22,10 @@
 | `launcher/fork/dev-debug.cjs` | dev 期诊断：CDP 9222 端口（`enableDevRemoteDebugging`）、renderer console 转发 + 捕获阶段事件探针（`attachWindowDiagnostics`）。仅 `!app.isPackaged` 生效 |
 | `gateway/runtime/relay/relay-config.cjs` | 反连客户端配置（读 `OCX_RELAY_*` 环境变量，浏览器登录态独立校验） |
 | `gateway/runtime/relay/reverse-tunnel-client.cjs` | 反向隧道客户端：出站 WS 反连 VPS，多路复用 HTTP/WS（帧协议 register/open/head/data/end/ws-open/ws-close/ping，**逐帧保真含 `bin` 帧类型**） |
+| `proxy/deploy.sh` | Linux/systemd 部署管理（安装、启动、停止、重启、更新、状态、日志）；默认 HTTP，更新保留用户数据并支持启动失败回滚 |
 | `proxy/server.js` | VPS 中继服务端：看板（账号密码登录、AES-256-GCM 加密存储 auth.json、改密码/改用户名、登录失败 5 次冻结该 IP 10 分钟带倒计时）、`/d/<id>/` 透明反代（HTTP+WS，逐帧保真）、设备 cookie 根路径通配反代、re-bind 冲突保护 |
-| `proxy/test-harness.cjs` | 服务端 26 用例自测（`node test-harness.cjs`，含 WS 帧类型严格校验、改用户名/重名/冻结回归） |
-| `proxy/README.md`、`codex-gateway/**` | 部署文档（`codex-gateway/` 内方案 A 遗留文件已废弃可删） |
+| `gateway/test/proxy.integration.cjs` | 中继服务 36 项集成检查（`pnpm test:proxy`，含 WS 帧类型严格校验、改用户名/重名/冻结回归） |
+| `docs/PROXY_DEPLOYMENT.md`、`codex-gateway/**` | 部署文档（`codex-gateway/` 内方案 A 遗留文件已废弃可删） |
 
 ## 二、薄改动的 upstream 文件（合并时按标记处理）
 
@@ -58,7 +59,7 @@ compatibility 结构，按语义移植：只有真实故障（location/applicati
 ### `README.md`（+22 行，整块新增）
 
 「### 远程访问」章节末尾的「### 服务器中继部署（多设备统一入口）」小节（`[OCX-FORK] BEGIN/END` 包裹），
-介绍服务器中继模式并跳转 `proxy/README.md`。合并时保留整块；若 upstream 改动该章节周边文字，块外正常合并即可。
+介绍服务器中继模式并跳转 `docs/PROXY_DEPLOYMENT.md`。合并时保留整块；若 upstream 改动该章节周边文字，块外正常合并即可。
 
 ## 三、UI 整块新增（带标记，合并冲突时保留 fork 块）
 
@@ -85,16 +86,16 @@ git merge upstream/main          # 或 rebase，看个人习惯
 1. **新逻辑一律进新文件**：launcher 侧进 `launcher/fork/`，gateway 侧进 `gateway/runtime/relay/`，
    服务端进 `proxy/`；main.cjs 只允许出现 1~3 行的薄调用点。
 2. **凡是动到 upstream 原文件，必须加 `[OCX-FORK]` 注释标记**（并同步更新本文档）。
-3. 修改 relay/WS 协议时，`proxy/test-harness.cjs` 必须同步补用例（协议级断言，不只是内容断言）。
-4. 改完必跑验证：`pnpm run build:gateway` + `proxy` 目录 `node test-harness.cjs`（26 用例）+ dev 冒烟。
+3. 修改 relay/WS 协议时，`gateway/test/proxy.integration.cjs` 必须同步补用例（协议级断言，不只是内容断言）。
+4. 改完必跑验证：`pnpm run build:gateway` + 仓库根目录 `pnpm test:proxy`（36 项集成检查）+ dev 冒烟。
 
 ## 六、验证命令
 
 ```bash
 # 1) gateway 编译（含 modification-boundaries 检查）
 pnpm run build:gateway
-# 2) 中继服务端自测（26 用例 ALL PASS）
-cd proxy && node test-harness.cjs
+# 2) 中继服务端自测（36 项集成检查 ALL PASS）
+pnpm test:proxy
 # 3) launcher dev 冒烟
 pnpm run launcher:dev
 ```

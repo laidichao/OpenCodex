@@ -49,7 +49,7 @@ function normalizeRelayPort(value) {
 }
 
 // 自定义访问后缀：小写字母/数字开头，允许小写字母、数字、中划线、下划线，长度 2-32。
-// 留空表示使用首次生成并保存的随机设备 ID。设备页地址 = https://<vps>:<port>/d/<后缀或设备ID>/
+// 留空表示使用首次生成并保存的随机设备 ID；访问协议由 HTTPS 开关决定。
 function normalizeRelayPath(value) {
   const text = String(value || "")
     .trim()
@@ -68,7 +68,7 @@ const RELAY_DEFAULT_FIELDS = Object.freeze({
   relayDeviceId: "",
   relayDeviceName: "",
   relayCustomPath: "",
-  relayTlsInsecure: false,
+  relayUseHttps: false,
 });
 
 // 对任意来源（磁盘 JSON / 内存 settings / IPC 入参）的 relay 字段做统一 normalize。
@@ -82,7 +82,8 @@ function normalizeRelayFields(source) {
     relayDeviceId: normalizeRelayString(src.relayDeviceId),
     relayDeviceName: normalizeRelayString(src.relayDeviceName),
     relayCustomPath: normalizeRelayPath(src.relayCustomPath),
-    relayTlsInsecure: src.relayTlsInsecure === true,
+    // HTTPS 必须明确开启，缺省和未勾选均使用 HTTP。
+    relayUseHttps: src.relayUseHttps === true,
   };
 }
 
@@ -95,7 +96,9 @@ function relayPrimaryUrl(settings) {
   if (hostModeOf(relay.hostMode) !== "server" || !relayHost) return null;
   const accessId = normalizeRelayPath(relay.relayCustomPath) || normalizeRelayString(relay.relayDeviceId);
   if (!accessId) return null;
-  return `https://${relayHost}:${normalizeRelayPort(relay.relayPort)}/d/${encodeURIComponent(accessId)}/`;
+  // 页面协议与反连协议使用同一个持久化开关。
+  const protocol = relay.relayUseHttps === true ? "https" : "http";
+  return `${protocol}://${relayHost}:${normalizeRelayPort(relay.relayPort)}/d/${encodeURIComponent(accessId)}/`;
 }
 
 // 「打开 OpenCodex」按钮在服务器模式下的行为判定：返回应打开的 URL，或 null（走原有流程）。
@@ -147,14 +150,14 @@ function createRelayCore(deps) {
     if (relayHost) {
       env.OCX_RELAY_ENABLED = "1";
       // UI 只填 IP + 端口，完整反连地址统一在这里拼接。
-      env.OCX_RELAY_URL = `wss://${relayHost}:${normalizeRelayPort(relay.relayPort)}/openCodeProxy`;
+      const protocol = relay.relayUseHttps === true ? "wss" : "ws";
+      env.OCX_RELAY_URL = `${protocol}://${relayHost}:${normalizeRelayPort(relay.relayPort)}/openCodeProxy`;
       if (relay.relaySecret) env.OCX_RELAY_SECRET = relay.relaySecret;
       // 反连注册 ID：有自定义访问后缀时用它（与顶部访问地址 /d/<后缀>/ 保持一致），
       // 服务端会自动把登记条目 re-bind 到该 ID；否则用已保存的随机设备 ID。
       const registerId = relayCustomPath || normalizeRelayString(relay.relayDeviceId);
       if (registerId) env.OCX_RELAY_DEVICE_ID = registerId;
       if (relay.relayDeviceName) env.OCX_RELAY_DEVICE_NAME = relay.relayDeviceName;
-      if (relay.relayTlsInsecure) env.OCX_RELAY_TLS_INSECURE = "1";
     } else {
       env.HOST = "127.0.0.1";
     }
@@ -175,7 +178,7 @@ function createRelayCore(deps) {
     return async function handleUpdateRelay(_event, relay) {
       const relayInput = relay && typeof relay === "object" ? relay : {};
       appendLog(
-        `[launcher] update-relay invoked host=${relayInput.relayHost ? "<set>" : "<empty>"} port=${JSON.stringify(relayInput.relayPort)} secret=${relayInput.relaySecret ? "<set>" : "<empty>"} tls=${relayInput.relayTlsInsecure} path=${JSON.stringify(relayInput.relayCustomPath || "")}\n`
+        `[launcher] update-relay invoked host=${relayInput.relayHost ? "<set>" : "<empty>"} port=${JSON.stringify(relayInput.relayPort)} secret=${relayInput.relaySecret ? "<set>" : "<empty>"} https=${relayInput.relayUseHttps} path=${JSON.stringify(relayInput.relayCustomPath || "")}\n`
       );
       const paths = runtimePaths();
       ensureRuntimeLayout(paths);
@@ -187,8 +190,6 @@ function createRelayCore(deps) {
         ...normalizeRelayFields(relayInput),
         // UI 不提交设备码；保存面板时沿用已持久化的身份，且不允许 IPC 替换它。
         relayDeviceId: normalizeRelayString(currentSettings.relayDeviceId),
-        // 显式覆盖：IPC 入参的布尔必须精确 true/false，不吞 undefined。
-        relayTlsInsecure: relayInput.relayTlsInsecure === true,
       };
       // 服务器模式强制设置访问密码：自定义后缀的地址好记也可被猜测，公网入口必须有密码保护。
       if (

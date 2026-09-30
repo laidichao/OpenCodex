@@ -204,10 +204,9 @@ function startReverseTunnel({ diagnosticLog = () => {}, diagnosticWarn = () => {
     if (!/\/openCodeProxy\b/.test(target)) target = target.replace(/\/?$/, "/openCodeProxy");
     const fullUrl = target + auth;
     diagnosticLog("relay", "connecting", { url: target, deviceId: cfg.deviceId });
-    const wsOpts = {};
-    if (process.env.OCX_RELAY_TLS_INSECURE === "1") wsOpts.rejectUnauthorized = false;
     try {
-      ws = new WebSocket(fullUrl, wsOpts);
+      // HTTPS 使用默认的证书验证，不再提供跳过验证的兼容开关。
+      ws = new WebSocket(fullUrl);
     } catch (e) {
       diagnosticWarn("relay", "connect_failed", { error: String(e) });
       scheduleReconnect();
@@ -266,7 +265,6 @@ function startReverseTunnel({ diagnosticLog = () => {}, diagnosticWarn = () => {
       // 不打日志的话只能看到 connecting -> disconnected，无从定位。
       diagnosticWarn("relay", "socket_error", {
         error: String((e && e.message) || e),
-        tlsInsecure: process.env.OCX_RELAY_TLS_INSECURE === "1",
       });
       try {
         ws.close();

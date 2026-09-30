@@ -32,7 +32,12 @@ const wsCompressionOptions = {
   zlibDeflateOptions: { level: 1 },
 };
 
-const PORT = Number(process.env.RELAY_PORT || 8443);
+// 网页与命令行共用端口配置；显式环境变量仍可用于手动启动和隔离联调。
+const RELAY_CONFIG_FILE = process.env.RELAY_CONFIG_FILE || path.join(__dirname, "relay.env");
+let configText = fs.existsSync(RELAY_CONFIG_FILE) ? fs.readFileSync(RELAY_CONFIG_FILE, "utf8") : "";
+const configuredPort = /^RELAY_PORT=(\d+)\s*$/m.exec(configText);
+let PORT = Number(process.env.RELAY_PORT || (configuredPort && configuredPort[1]) || 8443);
+let portChangePending = false;
 const HOST = process.env.RELAY_HOST || "0.0.0.0";
 const TLS_KEY = process.env.TLS_KEY || "";
 const TLS_CERT = process.env.TLS_CERT || "";
@@ -374,6 +379,10 @@ function dashboardHtml(username) {
  .manage input:focus{border-color:#3b82f6}
  .manage button{background:#2563eb;color:#fff;padding:11px 20px}
  .manage button:hover{background:#1d4ed8}
+ .port-settings{margin-bottom:24px}
+ .port-settings .manage{flex-wrap:wrap;margin-bottom:8px;align-items:center}
+ .port-settings input{min-width:100px;max-width:160px}
+ .port-settings p{font-size:13px;color:#9aa1ad;overflow-wrap:anywhere}
  .grid{display:grid;gap:14px}
  .card{background:#141821;border:1px solid #232a37;border-radius:13px;padding:18px 20px;display:flex;align-items:center;justify-content:space-between;gap:16px;transition:border-color .15s}
  .card:hover{border-color:#31405c}
@@ -402,6 +411,14 @@ function dashboardHtml(username) {
  <div class="hd-right"><span class="avatar">${escapeHtml(username.slice(0, 1).toUpperCase())}</span><span>${userLabel}</span><button class="logout" onclick="renameSelf()">改用户名</button><button class="logout" onclick="location.href='/change-password'">改密码</button><button class="logout" onclick="logout()">退出</button></div>
 </header>
 <main>
+ <section class="port-settings" aria-label="中继端口设置">
+  <div class="manage">
+   <label for="relayPort">监听端口</label>
+   <input id="relayPort" type="number" min="1" max="65535" value="${PORT}" required />
+   <button id="savePort" onclick="savePort()">保存端口</button>
+  </div>
+  <p id="portResult" role="status">修改前请放行新端口；保存成功后需在 PC 启动器同步修改中继端口。HTTPS 反向代理需同步更新上游配置。</p>
+ </section>
  <div class="manage">
   <input id="newName" placeholder="设备名称（如 办公机），可留空自动生成" />
   <button onclick="addDevice()">＋ 添加设备</button>
@@ -411,8 +428,33 @@ function dashboardHtml(username) {
 <div id="toast"></div>
 <script>
 var secretVisible=false;
+// 端口保存失败保留当前入口，成功提供新地址供用户确认后跳转。
+async function savePort(){
+ var input=document.getElementById('relayPort'),button=document.getElementById('savePort'),result=document.getElementById('portResult');
+ if(!input.reportValidity())return;
+ button.disabled=true;button.textContent='保存中…';
+ try{
+  var response=await fetch('/api/settings/port',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({port:Number(input.value)})});
+  var data=await response.json();
+  if(!data.ok)throw new Error(data.error||'保存失败');
+  var target=new URL(location.href);target.port=String(data.port);target.pathname='/';target.search='';target.hash='';
+  result.textContent='已保存端口 '+data.port+'。请同步修改 PC 中继端口。新入口：';
+  var link=document.createElement('a');link.href=target.href;link.textContent=target.href;result.appendChild(link);
+ }catch(error){result.textContent='保存失败：'+error.message;}
+ finally{button.disabled=false;button.textContent='保存端口';}
+}
 function toast(msg,isErr){var t=document.getElementById('toast');t.textContent=msg;t.className=isErr?'err show':'show';setTimeout(function(){t.classList.remove('show')},2200);}
-function copyText(s){if(navigator.clipboard){navigator.clipboard.writeText(s).then(function(){toast('已复制')});}else{toast('复制失败，请手动选择',true);}}
+// HTTP 没有异步剪贴板权限时使用选区复制，失败保留选区供用户手动复制。
+async function copyText(s){
+ if(window.isSecureContext && navigator.clipboard){
+  try{await navigator.clipboard.writeText(s);toast('已复制');return;}catch(e){}
+ }
+ var input=document.createElement('textarea');input.value=s;input.setAttribute('aria-label','待复制内容');
+ document.body.appendChild(input);input.focus();input.select();
+ var copied=false;try{copied=document.execCommand('copy');}catch(e){}
+ if(copied){input.remove();toast('已复制');}
+ else{toast('自动复制失败，请手动复制已选中的内容',true);input.addEventListener('blur',function(){input.remove();},{once:true});}
+}
 async function addDevice(){var n=document.getElementById('newName');try{var r=await fetch('/api/devices',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:n.value})});var d=await r.json();if(d.ok){toast('已生成设备：'+d.id);n.value='';load();}else{toast('失败：'+(d.error||r.status),true);}}catch(e){toast('失败：'+e.message,true);}}
 async function delDevice(id){if(!confirm('删除设备 '+id+'？其密钥立即失效，在线连接将被踢出。'))return;try{var r=await fetch('/api/devices/'+encodeURIComponent(id),{method:'DELETE'});var d=await r.json();if(d.ok){toast('已删除 '+id);load();}else{toast('失败：'+(d.error||r.status),true);}}catch(e){toast('失败：'+e.message,true);}}
 async function logout(){try{await fetch('/logout',{method:'POST'});}catch(e){}location.href='/login';}
@@ -703,7 +745,7 @@ function requireSession(req, res) {
   return null;
 }
 
-const server = (tlsOpts ? https.createServer(tlsOpts) : http.createServer()).on(
+let server = (tlsOpts ? https.createServer(tlsOpts) : http.createServer()).on(
   "request",
   async (req, res) => {
     try {
@@ -825,6 +867,63 @@ const server = (tlsOpts ? https.createServer(tlsOpts) : http.createServer()).on(
         }
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
         return res.end(dashboardHtml(session.username));
+      }
+      if (pathname === "/api/settings/port") {
+        // 仅完成首次改密的管理员会话可以更改监听端口。
+        const session = requireSession(req, res);
+        if (!session) return;
+        if (session.mustChange) return json(res, 403, { ok: false, error: "请先修改初始密码" });
+        if (req.method === "GET") return json(res, 200, { ok: true, port: PORT });
+        if (req.method !== "POST") return json(res, 405, { ok: false, error: "method not allowed" });
+        // 浏览器跨站表单不得修改服务入口；同源 JSON 请求以及直接管理 API 均可用。
+        if (!String(req.headers["content-type"] || "").startsWith("application/json") ||
+            (req.headers.origin && new URL(req.headers.origin).host !== req.headers.host)) {
+          return json(res, 403, { ok: false, error: "仅允许同源 JSON 请求" });
+        }
+        // 读取表单端口，要求 JSON 整数，避免隐式类型转换接受非法输入。
+        const body = await readJsonBody(req);
+        const nextPort = body.port;
+        if (!Number.isInteger(nextPort) || nextPort < 1 || nextPort > 65535) {
+          return json(res, 400, { ok: false, error: "端口必须为 1–65535 的整数" });
+        }
+        if (portChangePending) return json(res, 409, { ok: false, error: "端口修改中，请稍后再试" });
+        if (nextPort === PORT) return json(res, 200, { ok: true, port: PORT });
+        portChangePending = true;
+        let nextServer;
+        try {
+          // 先绑定新端口并复用原有 HTTP/WS 路由，失败时原监听和连接不受影响。
+          nextServer = tlsOpts ? https.createServer(tlsOpts) : http.createServer();
+          for (const event of ["request", "upgrade"]) {
+            for (const listener of server.listeners(event)) nextServer.on(event, listener);
+          }
+          await new Promise((resolve, reject) => {
+            nextServer.once("error", reject);
+            nextServer.listen(nextPort, HOST, () => { nextServer.removeListener("error", reject); resolve(); });
+          });
+          // 原子保存配置后才关闭旧监听；保留会话和已有隧道，PC 可自行切换新端口。
+          configText = fs.existsSync(RELAY_CONFIG_FILE) ? fs.readFileSync(RELAY_CONFIG_FILE, "utf8") : "";
+          const nextConfig = configText.replace(/^RELAY_PORT=.*(?:\r?\n|$)/gm, "");
+          const temporaryFile = `${RELAY_CONFIG_FILE}.${process.pid}.tmp`;
+          try {
+            fs.writeFileSync(temporaryFile, `${nextConfig.trimEnd()}\nRELAY_PORT=${nextPort}\n`, { mode: 0o600 });
+            fs.renameSync(temporaryFile, RELAY_CONFIG_FILE);
+          } finally {
+            if (fs.existsSync(temporaryFile)) fs.unlinkSync(temporaryFile);
+          }
+          const previousServer = server;
+          server = nextServer;
+          PORT = nextPort;
+          previousServer.close();
+          if (previousServer.closeIdleConnections) previousServer.closeIdleConnections();
+          return json(res, 200, { ok: true, port: PORT });
+        } catch (error) {
+          if (nextServer && nextServer.listening) nextServer.close();
+          console.error("[proxy] port change failed:", error.code || error.name);
+          const message = error.code === "EADDRINUSE" ? "端口已被占用，请选择其他端口" : "端口修改失败，请检查监听权限及配置文件写入权限";
+          return json(res, 409, { ok: false, error: message });
+        } finally {
+          portChangePending = false;
+        }
       }
       if (pathname === "/api/status") {
         const session = requireSession(req, res);

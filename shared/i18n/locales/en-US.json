@@ -45,8 +45,6 @@
   "launcher.settings.relay.deviceNamePlaceholder": "Defaults to computer name",
   "launcher.settings.relay.secret": "Device Secret",
   "launcher.settings.relay.secretPlaceholder": "Generate on the server dashboard, then paste here",
-  "launcher.settings.relay.tlsInsecure": "Skip TLS verification",
-  "launcher.settings.relay.tlsInsecureLabel": "Skip TLS certificate verification (for self-signed certs)",
   "launcher.settings.port.label": "Port",
   "launcher.settings.port.description": "Network port listened by the service",
   "launcher.settings.auth.label": "Access password",
@@ -152,5 +150,7 @@
   "web.workspaceRoot.error.notDirectory": "That path is not a folder.",
   "web.workspaceRoot.error.noAccess": "You do not have permission to access that path.",
   "web.workspaceRoot.error.unavailable": "That folder path cannot be used.",
-  "web.workspaceRoot.error.addFailed": "Failed to add folder: {error}"
+  "web.workspaceRoot.error.addFailed": "Failed to add folder: {error}",
+  "launcher.settings.relay.useHttps": "Use HTTPS",
+  "launcher.settings.relay.useHttpsLabel": "Use HTTPS"
 }
