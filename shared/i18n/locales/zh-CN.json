@@ -146,7 +146,7 @@
   "launcher.settings.relay.customPath": "访问后缀（可选）",
   "launcher.settings.relay.customPathPlaceholder": "如 my-office，留空使用随机码",
   "launcher.settings.relay.needPassword": "服务器模式必须先设置访问密码（上方「访问密码」），否则公网入口无保护。",
-  "launcher.settings.relay.deviceId": "设备随机码",
+  "launcher.settings.relay.deviceId": "设备 MAC",
   "launcher.settings.relay.deviceName": "本机名称",
   "launcher.settings.relay.deviceNamePlaceholder": "留空用计算机名",
   "launcher.settings.relay.secret": "设备密钥",

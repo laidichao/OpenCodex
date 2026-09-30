@@ -40,7 +40,7 @@
   "launcher.settings.relay.customPath": "Access path suffix (optional)",
   "launcher.settings.relay.customPathPlaceholder": "e.g. my-office; blank = random code",
   "launcher.settings.relay.needPassword": "Server mode requires the access password (see \"Access Password\" above), otherwise the public entry is unprotected.",
-  "launcher.settings.relay.deviceId": "Device code",
+  "launcher.settings.relay.deviceId": "Device MAC",
   "launcher.settings.relay.deviceName": "Device Name",
   "launcher.settings.relay.deviceNamePlaceholder": "Defaults to computer name",
   "launcher.settings.relay.secret": "Device Secret",

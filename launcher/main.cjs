@@ -560,7 +560,7 @@ function updateGatewayUrls() {
   gatewayState.lanUrls = gatewayState.host === "0.0.0.0" ? lanUrlsForPort(gatewayState.port) : [];
 
   // [OCX-FORK] 服务器模式：顶部访问地址指向 VPS 统一入口里本机设备的页面；有自定义访问
-  // 后缀时优先用后缀（反连注册也用同一 ID）。relayPrimaryUrl 返回 null 时回退原有逻辑。
+  // 后缀时优先用后缀，设备 MAC 与访问路径分别保存。relayPrimaryUrl 返回 null 时回退原有逻辑。
   // 实现见 launcher/fork/relay-core.cjs。
   gatewayState.primaryUrl =
     relayPrimaryUrl(gatewayState.settings) ||
@@ -871,6 +871,10 @@ async function startGatewayOnce() {
   gatewayState.paths = paths;
   ensureRuntimeLayout(paths);
   gatewayState.settings = await ensurePortSetting(paths, loadLauncherSettings(paths));
+  if (gatewayState.settings.hostMode === "server") {
+    // 拼接公开地址前先确定 MAC 和独立随机后缀，避免首轮启动仍指向本地地址。
+    gatewayState.settings = relayCore.ensureRelayIdentity(paths, gatewayState.settings);
+  }
   applyPreventSleepSetting(gatewayState.settings);
   gatewayState.host = hostForMode(gatewayState.settings.hostMode);
   const officialAutoScanUpgrade = !skipOfficialScan && normalizeOfficialAutoScanUpgrade(gatewayState.settings.officialAutoScanUpgrade);

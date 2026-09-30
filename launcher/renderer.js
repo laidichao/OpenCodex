@@ -152,7 +152,7 @@ function renderRelay(settings, authEnabled) {
   setVal("relayCustomPathInput", relay.relayCustomPath || "");
   const deviceIdText = $("relayDeviceIdText");
   if (deviceIdText) {
-    // 展示完整随机设备码，与实际默认访问后缀保持一致。
+    // 展示设备 MAC；访问后缀独立保存，不作为设备身份。
     deviceIdText.value = String(relay.relayDeviceId || "");
   }
   setVal("relayDeviceNameInput", relay.relayDeviceName || "");

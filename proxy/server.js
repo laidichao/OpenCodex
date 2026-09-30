@@ -3,7 +3,7 @@
 // 架构（方案 B）：
 //   - PC 端 OpenCodex 内嵌反连客户端，主动出站 WSS 连到本进程 /openCodeProxy，把本机
 //     gateway 的整个 HTTP+WS 能力反推上来。PC 侧零入站端口、零穿透客户端、零公网暴露。
-//   - 浏览器访问 https://<vps>/ 看到设备看板；进入 /d/<deviceId>/ 即该设备的 Codex Desktop UI。
+//   - 浏览器访问服务器看到设备看板；进入 /d/<accessPath>/ 即该设备的 Codex Desktop UI。
 //   - 设备 UI 的 HTML 使用根绝对路径引用资源（/official-patched-v8/...、/codex-web-config.js）
 //     与运行时 API（/api/*、/backend-api/*），因此除看板自身固定路由外，所有根路径请求都按
 //     「设备 cookie（ocx_device）」反代到对应设备——这是设备页能完整加载的关键。
@@ -77,7 +77,7 @@ function sanitizeDeviceId(name) {
 // ---------- devices.json：设备与密钥持久化 ----------
 function saveDevices(registry) {
   const obj = {};
-  for (const [id, info] of registry) obj[id] = { secret: info.secret, name: info.name || id };
+  for (const [id, info] of registry) obj[id] = { secret: info.secret, name: info.name || id, accessPath: info.accessPath || "" };
   try {
     fs.writeFileSync(DEVICES_FILE, JSON.stringify(obj, null, 2));
   } catch (error) {
@@ -91,7 +91,7 @@ function loadDevices() {
     const obj = JSON.parse(fs.readFileSync(DEVICES_FILE, "utf8"));
     for (const [id, info] of Object.entries(obj)) {
       if (!id || !info || !info.secret) continue;
-      registry.set(String(id), { secret: String(info.secret), name: String(info.name || id) });
+      registry.set(String(id), { secret: String(info.secret), name: String(info.name || id), accessPath: String(info.accessPath || "") });
     }
   } catch {}
   if (registry.size === 0) {
@@ -248,11 +248,13 @@ function sessionCookie(token) {
 const CLEAR_SESSION_COOKIE = `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
 
 // ---------- 设备路径解析 ----------
-// /d/<deviceId>/... -> { deviceId, rest }
+// 浏览器后缀只解析到设备身份，不把 MAC 直接当作公开访问地址。
 function parseDevicePath(urlPath) {
   const m = urlPath.match(/^\/d\/([^/]+)(\/.*)?$/);
   if (!m) return null;
-  return { deviceId: decodeURIComponent(m[1]), rest: m[2] || "/" };
+  const accessPath = decodeURIComponent(m[1]);
+  const entry = [...DEVICE_REGISTRY.entries()].find(([, info]) => info.accessPath === accessPath);
+  return { deviceId: entry ? entry[0] : "", rest: m[2] || "/" };
 }
 
 // ---------- 设备在线表 ----------
@@ -477,14 +479,14 @@ async function load(){
   var on=!!x.online;
   return '<div class="card'+(on?'':' offline')+'">'
    +'<div class="dev-main">'
-   +'<div class="dev-name"><a href="/d/'+encodeURIComponent(x.id)+'/" title="打开该设备的 Codex Desktop">'+esc(x.name||x.id)+'</a>'
+   +'<div class="dev-name"><a href="/d/'+encodeURIComponent(x.accessPath)+'/" title="打开该设备的 Codex Desktop">'+esc(x.name||x.id)+'</a>'
    +'<span class="status '+(on?'st-online':'st-offline')+'"><span class="led"></span>'+(on?'在线':'离线')+'</span></div>'
    +'<span class="devid">'+esc(x.id)+'</span>'
    +'<div class="secret-row"><span class="secret" title="设备密钥（PC 端粘贴用）">'+esc(x.secret)+'</span>'
    +'<button class="mini" onclick="copyText(\\''+esc(x.secret)+'\\')">复制密钥</button></div>'
    +'</div>'
    +'<div class="actions">'
-   +'<a class="open-btn" href="/d/'+encodeURIComponent(x.id)+'/">'+(on?'打开':'打开(离线)')+'</a>'
+   +'<a class="open-btn" href="/d/'+encodeURIComponent(x.accessPath)+'/">'+(on?'打开':'打开(离线)')+'</a>'
    +'<button class="mini danger" onclick="delDevice(\\''+esc(x.id)+'\\')">删除</button>'
    +'</div></div>';
  }).join('');
@@ -527,7 +529,7 @@ function listDevices() {
   const list = [];
   for (const [id, info] of DEVICE_REGISTRY) {
     const dev = devices.get(id);
-    list.push({ id, name: info.name || id, secret: info.secret, online: !!(dev && dev.online) });
+    list.push({ id, name: info.name || id, accessPath: info.accessPath || "", secret: info.secret, online: !!(dev && dev.online) });
   }
   return list;
 }
@@ -543,9 +545,11 @@ async function handleDevicesApi(req, res, pathname) {
     while (DEVICE_REGISTRY.has(id)) id = `${wanted}-${crypto.randomBytes(2).toString("hex")}`;
     const secret = crypto.randomBytes(16).toString("hex");
     const name = String(body.name || "").trim() || id;
-    DEVICE_REGISTRY.set(id, { secret, name });
+    // 添加设备时生成独立访问后缀；客户端连接后再绑定实际 MAC 与其保存的后缀。
+    const accessPath = crypto.randomBytes(8).toString("hex");
+    DEVICE_REGISTRY.set(id, { secret, name, accessPath });
     saveDevices(DEVICE_REGISTRY);
-    return json(res, 200, { ok: true, id, secret, name });
+    return json(res, 200, { ok: true, id, secret, name, accessPath });
   }
   const delMatch = pathname.match(/^\/api\/devices\/([^/]+)$/);
   if (req.method === "DELETE" && delMatch) {
@@ -674,7 +678,8 @@ function handleProxyFrame(dev, msg) {
           else if (encoding === "br") body = zlib.brotliDecompressSync(body);
           else if (encoding === "deflate") body = zlib.inflateSync(body);
           // 只改变中继 WebSocket 地址，继续保留 Gateway 的语言、插件和认证配置。
-          out = rewriteConfigWsUrl(body, dev.id);
+          // 浏览器实时连接使用访问后缀，不能暴露或依赖内部设备 MAC。
+          out = rewriteConfigWsUrl(body, dev.accessPath);
           s._headers = { ...s._headers };
           delete s._headers["content-encoding"];
           // 已缓冲的改写响应使用最终长度，不能同时保留设备端的分块传输头。
@@ -710,10 +715,10 @@ function handleProxyFrame(dev, msg) {
   }
 }
 
-// config.js 重写：把 gatewayWsUrl 从 location.origin+/ws 改为 +/d/<id>/ws
-function rewriteConfigWsUrl(buf, deviceId) {
+// config.js 重写：实时连接与 HTTP 页面共用独立访问后缀。
+function rewriteConfigWsUrl(buf, accessPath) {
   let text = buf.toString("utf8");
-  text = text.replace(/(\.replace\(\/\^http\/,\s*"ws"\))\s*\+\s*"\/ws"/, `$1 + "/d/${deviceId}/ws"`);
+  text = text.replace(/(\.replace\(\/\^http\/,\s*"ws"\))\s*\+\s*"\/ws"/, `$1 + "/d/${accessPath}/ws"`);
   return Buffer.from(text, "utf8");
 }
 
@@ -970,14 +975,15 @@ proxyWss.on("connection", (ws, req) => {
   const url = new URL(req.url, "http://localhost");
   const rawDeviceId = url.searchParams.get("device") || "";
   const secret = url.searchParams.get("secret") || "";
-  // 设备 ID 规范化：小写字母/数字/中划线/下划线，最长 64（支持用户自定义访问后缀）。
-  const deviceId = rawDeviceId.toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, 64);
-  // 设备 ID 由 PC 端自报（本机 MAC 或自定义访问后缀），服务端只校验密钥值；
+  // 设备 MAC 与访问后缀分别校验；后缀变化不能修改设备身份。
+  const deviceId = rawDeviceId.toLowerCase();
+  const accessPath = url.searchParams.get("path") || "";
+  // 客户端报告 MAC 身份，服务端通过设备密钥找到已授权的登记条目；
   // 密钥命中后，把「添加设备」时占位的登记条目迁移到该设备 ID 名下。
   const entry = [...DEVICE_REGISTRY.entries()].find(([, info]) => info.secret === secret);
-  if (!secret || !deviceId || !entry) {
+  if (!secret || !/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(deviceId) || !/^[a-z0-9][a-z0-9_-]{1,31}$/.test(accessPath) || !entry) {
     try {
-      ws.send(JSON.stringify({ t: "register-reject", reason: "bad secret or missing device id" }));
+      ws.send(JSON.stringify({ t: "register-reject", reason: "bad secret, device MAC or access path" }));
     } catch {}
     try {
       ws.close(1008, "auth failed");
@@ -985,8 +991,17 @@ proxyWss.on("connection", (ws, req) => {
     return;
   }
   const [boundId, boundInfo] = entry;
+  // 已登记的身份和后缀不能被其他密钥覆盖，包括暂时离线的设备。
+  const conflict = [...DEVICE_REGISTRY.entries()].some(([id, info]) =>
+    id !== boundId && (id === deviceId || info.accessPath === accessPath)
+  );
+  if (conflict) {
+    ws.send(JSON.stringify({ t: "register-reject", reason: "device MAC or access path already in use" }));
+    ws.close(1008, "identity conflict");
+    return;
+  }
   if (boundId !== deviceId) {
-    // 目标 ID 已被另一台在线设备占用（如两台 PC 填了同一个自定义后缀）→ 拒绝注册，
+    // MAC 已被另一条在线连接占用时拒绝重新绑定，
     // 避免互相顶号导致流量错乱；PC 端会收到 register-reject 原因。
     const existingDev = devices.get(deviceId);
     if (existingDev && existingDev.socket && existingDev.socket.readyState === 1) {
@@ -1003,12 +1018,18 @@ proxyWss.on("connection", (ws, req) => {
     DEVICE_REGISTRY.set(deviceId, {
       secret: boundInfo.secret,
       name: boundInfo.name && boundInfo.name !== boundId ? boundInfo.name : deviceId,
+      accessPath,
     });
     saveDevices(DEVICE_REGISTRY);
     console.log(`[proxy] device re-bound: ${boundId} -> ${deviceId}`);
+  } else if (boundInfo.accessPath !== accessPath) {
+    // 只更新后缀映射，不重建设备登记和密钥。
+    boundInfo.accessPath = accessPath;
+    saveDevices(DEVICE_REGISTRY);
   }
   const dev = {
     id: deviceId,
+    accessPath,
     name: deviceId,
     socket: ws,
     online: true,
@@ -1131,7 +1152,7 @@ server.on("upgrade", (req, socket, head) => {
       socket.destroy();
       return;
     }
-    req.url = `/d/${encodeURIComponent(dev.id)}${pathname}${url.search}`;
+    req.url = `/d/${encodeURIComponent(dev.accessPath)}${pathname}${url.search}`;
   }
   browserWss.handleUpgrade(req, socket, head, (ws) => browserWss.emit("connection", ws, req));
 });

@@ -1,6 +1,6 @@
 # openCodeProxy —— OpenCodex 反向隧道代理（VPS 统一入口）
 
-部署在**有公网 IP 的 VPS** 上的单文件代理服务：接收 PC 端 OpenCodex 的主动反连，提供设备导航看板，并把浏览器对 `/d/<deviceId>/*` 的 HTTP 与 WebSocket 请求透明代理到对应 PC。
+部署在**有公网 IP 的 VPS** 上的单文件代理服务：接收 PC 端 OpenCodex 的主动反连，提供设备导航看板，并把浏览器对 `/d/<accessPath>/*` 的 HTTP 与 WebSocket 请求透明代理到对应 PC。
 
 ```
 浏览器 ──HTTP/WS（可选 HTTPS/WSS）──> VPS(openCodeProxy :8443) <──WS /openCodeProxy 反连── PC1 (OpenCodex gateway)
@@ -133,11 +133,11 @@ node server.js
 
 ## 设备与密钥管理（看板）
 
-设备表持久化在 `devices.json`（deviceId / secret / name）。首次启动从 `DEVICE_SECRETS` 导入并落盘，之后**以文件为准**，改环境变量不再生效。
+设备表持久化在 `devices.json`（deviceId / secret / name / accessPath）。客户端上线后，deviceId 为设备 MAC；accessPath 是独立访问后缀。首次启动从 `DEVICE_SECRETS` 导入并落盘，之后**以文件为准**，改环境变量不再生效。
 
 浏览器打开 `http://<服务器地址>:8443/`，用账号密码登录（首次部署为 admin/admin，登录后强制改密）：
 
-- **添加设备**：输入名称（可留空），服务端生成 deviceId 与 32 位随机密钥，界面直接展示并可复制。
+- **添加设备**：输入名称（可留空），服务端生成登记条目、随机访问后缀与 32 位随机密钥；客户端连接后以 MAC 绑定设备身份。
 - **复制密钥**：每台设备行内有「复制密钥」按钮。
 - **删除设备**：密钥立即失效；在线连接会被踢掉。
 - PC 端上线后注册的设备名会自动写回 `devices.json`。
@@ -157,7 +157,8 @@ node server.js
 2. 打开设置 → **启动地址** 选 **「服务器」**（面板仅在此模式下显示）。
 3. 填写：
    - **服务器 IP**：服务器 IP 或域名（端口默认 8443，可改）
-   - **设备随机码**：首次自动生成并持久化，不可编辑；访问后缀留空使用随机码，也可填写自定义后缀
+   - **设备 MAC**：自动从本机网卡读取并保存，不可编辑，用于标识设备
+   - **访问后缀**：留空使用单独生成并保存的 16 位随机码，无 `pc-` 前缀；也可填写自定义后缀，修改后缀不改变 MAC 身份
    - **本机名称**：留空用计算机名
    - **设备密钥**：从看板「添加设备」生成后复制粘贴
    - **使用 HTTPS**：默认不勾选，使用 HTTP/WS；服务器提供有效 HTTPS 入口时勾选，使用 HTTPS/WSS
@@ -169,17 +170,17 @@ node server.js
 
 | 路径 | 说明 |
 |---|---|
-| `WS /openCodeProxy?device=<id>&secret=<s>` | PC 端反连接入点（注册即校验密钥） |
+| `WS /openCodeProxy?device=<mac>&path=<accessPath>&secret=<s>` | PC 端反连接入点（MAC 身份与访问后缀分离，注册即校验密钥） |
 | `GET /` | 设备导航看板 |
-| `GET/WS /d/<deviceId>/*` | 该设备的 Codex Desktop（HTTP + WS 经隧道盲代理） |
+| `GET/WS /d/<accessPath>/*` | 通过独立访问后缀进入该设备的 Codex Desktop（HTTP + WS 经隧道盲代理） |
 | `GET/POST/DELETE /api/devices[/<id>]` | 设备管理 API |
 | `GET/POST /api/settings/port` | 查询/修改中继监听端口，要求已改密的登录会话 |
 | `GET /api/status` | 在线连接列表 |
 
 ## 透明代理关键点
 
-浏览器访问 `/d/<id>/codex-web-config.js` 时，服务端会把其中的 `gatewayWsUrl` 从
-`location.origin + "/ws"` 自动改写为 `location.origin + "/d/<id>/ws"`，使 web-shell **无需改源码**即走隧道路径。
+浏览器访问 `/d/<accessPath>/codex-web-config.js` 时，服务端会把其中的 `gatewayWsUrl` 从
+`location.origin + "/ws"` 自动改写为 `location.origin + "/d/<accessPath>/ws"`，使 web-shell **无需改源码**即走隧道路径；MAC 不作为浏览器访问后缀。
 
 ## 安全清单
 

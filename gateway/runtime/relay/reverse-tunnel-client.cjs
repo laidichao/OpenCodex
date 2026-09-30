@@ -198,7 +198,7 @@ function startReverseTunnel({ diagnosticLog = () => {}, diagnosticWarn = () => {
   async function connect() {
     // 隧道只建立传输连接，Gateway 登录态由每个浏览器会话独立携带。
     const sep = cfg.url.includes("?") ? "&" : "?";
-    const auth = `${sep}device=${encodeURIComponent(cfg.deviceId)}&secret=${encodeURIComponent(cfg.secret)}`;
+    const auth = `${sep}device=${encodeURIComponent(cfg.deviceId)}&path=${encodeURIComponent(cfg.accessPath)}&secret=${encodeURIComponent(cfg.secret)}`;
     let target = cfg.url;
     // 允许 env 里只写 wss://host:port 不带路径；统一挂到 /openCodeProxy
     if (!/\/openCodeProxy\b/.test(target)) target = target.replace(/\/?$/, "/openCodeProxy");
