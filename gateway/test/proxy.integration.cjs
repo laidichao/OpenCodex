@@ -153,7 +153,9 @@ mock.listen(3737, "127.0.0.1", () => console.log("[test] mock gateway on :3737")
 process.env.OCX_RELAY_ENABLED = "1";
 process.env.OCX_RELAY_URL = "ws://127.0.0.1:8080/openCodeProxy";
 process.env.OCX_RELAY_SECRET = "testsecret";
-process.env.OCX_RELAY_DEVICE_ID = "mock";
+// 使用合法设备 MAC，并独立保留浏览器访问后缀，覆盖当前身份协议。
+process.env.OCX_RELAY_DEVICE_ID = "02:00:00:00:00:01";
+process.env.OCX_RELAY_ACCESS_PATH = "mock";
 process.env.OCX_RELAY_DEVICE_NAME = "MockPC";
 const { startReverseTunnel } = require("../runtime/relay/reverse-tunnel-client.cjs");
 startReverseTunnel({
@@ -282,7 +284,7 @@ setTimeout(async () => {
     const devPage = await request("/d/mock/");
     const devCookie = (devPage.setCookie || []).find((c) => c.startsWith("ocx_device="));
     check("未登录设备页显示 Gateway 登录入口", devPage.status === 200 && devPage.body.includes("Gateway login required"));
-    check("设备页绑定设备 cookie", !!devCookie && devCookie.includes("ocx_device=mock"), JSON.stringify(devPage.setCookie));
+    check("设备页绑定设备 cookie", !!devCookie && devCookie.includes("ocx_device=02%3A00%3A00%3A00%3A00%3A01"), JSON.stringify(devPage.setCookie));
     deviceCookie = devCookie ? devCookie.split(";")[0] : "";
 
     // Gateway 密码必须独立于 relay 管理员登录；HTTP 转发只保留 Gateway 自己的登录 Cookie。
@@ -309,7 +311,7 @@ setTimeout(async () => {
     });
     let gatewaySetCookie = "";
     for (const cookie of gatewayLogin.setCookie || []) {
-      if (cookie.startsWith(`${GATEWAY_AUTH_COOKIE}=`)) {
+      if (cookie.startsWith(`${GATEWAY_AUTH_COOKIE}_mock=`)) {
         gatewaySetCookie = cookie;
         break;
       }
@@ -355,7 +357,7 @@ setTimeout(async () => {
     // 11) 看板 API（会话内）
     const devices = await request("/api/devices");
     const devList = JSON.parse(devices.body).devices || [];
-    check("设备列表含 mock（re-bind 后）", devList.some((x) => x.id === "mock" && x.online));
+    check("设备列表含 mock（re-bind 后）", devList.some((x) => x.id === "02:00:00:00:00:01" && x.accessPath === "mock" && x.online));
 
     // 12) auth.json 加密存储：文件中不存在明文用户名/密码
     const authRaw = fs.readFileSync(process.env.RELAY_AUTH_FILE, "utf8");
@@ -364,11 +366,11 @@ setTimeout(async () => {
     // 13) re-bind：占位登记 legacy 已迁移到自定义后缀 mock
     const rebound = await request("/api/devices");
     const reboundList = JSON.parse(rebound.body).devices || [];
-    check("设备已 re-bind 到自定义后缀", reboundList.some((x) => x.id === "mock") && !reboundList.some((x) => x.id === "legacy"));
+    check("设备已 re-bind 到自定义后缀", reboundList.some((x) => x.id === "02:00:00:00:00:01" && x.accessPath === "mock") && !reboundList.some((x) => x.id === "legacy"));
 
     // 14) 冲突保护：另一密钥抢注同 ID（已在线）→ register-reject
     const conflict = await new Promise((resolve) => {
-      const c = new WebSocket("ws://127.0.0.1:8080/openCodeProxy?device=mock&secret=testsecret2");
+      const c = new WebSocket("ws://127.0.0.1:8080/openCodeProxy?device=02:00:00:00:00:01&path=mock&secret=testsecret2");
       const timer = setTimeout(() => resolve("TIMEOUT"), 3000);
       c.on("message", (m) => {
         clearTimeout(timer);

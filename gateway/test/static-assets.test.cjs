@@ -175,6 +175,8 @@ function createAppHostBridgeBehaviorHarness(bridge, { wsReady = true } = {}) {
     },
   };
   const functionNames = [
+    "settleWsReadyWaiters",
+    "markGatewayWsReady",
     "appHostPortId",
     "appHostMessageCodec",
     "encodeAppHostMessageData",
@@ -196,7 +198,8 @@ function createAppHostBridgeBehaviorHarness(bridge, { wsReady = true } = {}) {
     `
       const w = windowContext;
       const ws = socketContext;
-      const wsReady = wsReadyContext;
+      let wsReady = wsReadyContext;
+      const wsReadyWaiters = new Set();
       const clientId = "app-host-test-client";
       const providerGeneration = {};
       const modificationEffects = null;
@@ -216,7 +219,8 @@ function createAppHostBridgeBehaviorHarness(bridge, { wsReady = true } = {}) {
       function payloadShape(value) { return value === null ? "null" : typeof value; }
       function websocketStateName() { return "open"; }
       ${declarations}
-      ({ appHostPortRelays, installAppHostMessagePortBridge, handleAppHostGatewayMessage, w })
+      ({ appHostPortRelays, installAppHostMessagePortBridge, handleAppHostGatewayMessage, markGatewayWsReady,
+         setWsReady(ready) { wsReady = ready; }, w })
     `,
     {
       diagnostics,
@@ -227,7 +231,7 @@ function createAppHostBridgeBehaviorHarness(bridge, { wsReady = true } = {}) {
       wsReadyContext: wsReady,
     }
   );
-  return { ...result, diagnostics, fakePort, portListeners, publishedData, windowListeners, wsMessages };
+  return { ...result, diagnostics, fakePort, fakeSocket, portListeners, publishedData, windowListeners, wsMessages };
 }
 
 function makeTempDir(t) {
@@ -804,6 +808,47 @@ test("bridge reconnects active app-host ports after websocket hello", () => {
   // WS 瞬时断线只能让升级前已允许重试的安全读取回退 HTTP，写操作不得重复提交。
   assert.match(bridge, /clientDiagnostic\("ipc-ws-fallback"/);
   assert.match(bridge, /retryDelays\.length === 1 \|\| !isTransientGatewayFetchError\(error\)/);
+});
+
+test("bridge restores connect before queued uplink and keeps the MessagePort after reconnect", () => {
+  const bridge = fs.readFileSync(BRIDGE_POLYFILL, "utf-8");
+  // 执行生产 helper，验证首连积压和后台恢复均先绑定端口，再发送业务消息。
+  const harness = createAppHostBridgeBehaviorHarness(bridge, { wsReady: false });
+  harness.installAppHostMessagePortBridge();
+  harness.windowListeners.get("message")({
+    source: harness.w,
+    data: { type: "connect-app-host", port: harness.fakePort },
+    ports: [harness.fakePort],
+  });
+  const send = harness.portListeners.get("message");
+  send({ data: "first-message" });
+  assert.equal(harness.wsMessages.length, 0);
+  harness.fakeSocket.readyState = 1;
+  harness.markGatewayWsReady();
+  assert.deepEqual(harness.wsMessages.map((m) => m.type), ["app-host-connect", "app-host-port-message"]);
+  const state = [...harness.appHostPortRelays.values()][0];
+  harness.handleAppHostGatewayMessage({ type: "app-host-port-connected", portId: state.portId });
+
+  // 按 socket close 后的状态恢复；hello 前即使 socket 已 open，业务帧仍需等待握手。
+  harness.setWsReady(false);
+  state.connected = false;
+  harness.fakeSocket.readyState = 0;
+  send({ data: "queued-message" });
+  send({ data: "steer-message" });
+  harness.fakeSocket.readyState = 1;
+  assert.equal(harness.wsMessages.length, 2);
+  harness.markGatewayWsReady();
+  const restored = harness.wsMessages.slice(2);
+  assert.deepEqual(restored.map((m) => m.type), ["app-host-connect", "app-host-port-message", "app-host-port-message"]);
+  assert.deepEqual(restored.slice(1).map((m) => m.data), ["queued-message", "steer-message"]);
+  assert.ok(restored.every((m) => m.portId === state.portId));
+  assert.equal(state.pending.length, 0);
+  assert.equal(state.pendingChars, 0);
+  assert.equal(harness.fakePort.closed, false);
+  // hello 重复确认不能重复投递已经冲刷的业务帧。
+  harness.handleAppHostGatewayMessage({ type: "app-host-port-connected", portId: state.portId });
+  harness.markGatewayWsReady();
+  assert.equal(harness.wsMessages.length, 5);
 });
 
 test("injects the app-host codec before the bridge provider", (t) => {
