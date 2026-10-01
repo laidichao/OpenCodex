@@ -521,13 +521,9 @@ function createWsHub(
   function removeClient(ws) {
     flushAppHostTrafficForClient(socketClientId(ws));
     const clientId = socketClientId(ws);
-    if (!clientId || clientsById.get(clientId) === ws) {
-      // 浏览器后台断线不等于页面销毁；保留官方 MessagePort，避免下次 RPC 使用失效 export ID。
-      detachAppHostRelays(ws);
-    } else {
-      // 旧 socket 被新连接替换时，新连接已经接管页面，旧 relay 必须正常释放，不能覆盖新映射。
-      closeAppHostRelays(ws, "replaced");
-    }
+    // 浏览器后台断线和新 socket 接管之间存在竞态；两种情况下都先保留官方 MessagePort，
+    // 让同一 clientId 的新连接有机会复用原 RPC 会话，避免旧 socket 延迟 close 使 export ID 失效。
+    detachAppHostRelays(ws);
     clients.delete(ws);
     if (ws.__codexWebClientId && clientsById.get(ws.__codexWebClientId) === ws) {
       const clientId = ws.__codexWebClientId;
