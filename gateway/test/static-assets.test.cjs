@@ -553,6 +553,57 @@ test("Statsig AppHost startup reuses local Web initialization with an official f
   ).toString("utf8"), 'Tf.safePost(`/wham/other`,{})');
 });
 
+test("new thread placeholders skip premature official resume", (t) => {
+  const webviewDir = makeOfficialWebviewDir(t);
+  const service = createService(webviewDir);
+  const source =
+    "async function resume(i){let{conversationId:f,model:p}=i,x=e.getConversation(f),S=e.getHostId(),C=e.getWindowActivity(),w=C?.visibilityState;e.logger.info(`maybe_resume_started`);return e.sendRequest(`thread/resume`,{threadId:f})}";
+  const patched = service.patchOfficialAssetData(
+    `${PATCHED_OFFICIAL_PREFIX}assets/app-shared-resume-race-test.js`,
+    Buffer.from(source),
+    { headers: { host: "example.com" } }
+  ).toString("utf8");
+
+  // 新建占位线程只更新本地恢复状态，已有线程仍保留官方 resume 调用。
+  assert.match(patched, /threadResumeRaceGuard/);
+  assert.match(patched, /x\?\.resumeState===`needs_resume`&&x\?\.threadStartKind/);
+  assert.match(patched, /__opencodexThreadResumeGuards/);
+  assert.match(patched, /return\{status:`ready`\}/);
+  assert.match(patched, /sendRequest\(`thread\/resume`/);
+});
+
+test("hidden renderer keeps thread ownership for relay requests", (t) => {
+  const webviewDir = makeOfficialWebviewDir(t);
+  const service = createService(webviewDir);
+  const source =
+    "function tzn(){let e=document.visibilityState;return{canAcquireThreadStream:!ppn()&&nzn({isHotkeyWindow:ezn(),isWindowActive:e===`visible`&&document.hasFocus()}),routePath:window.location.pathname,visibilityState:e}}";
+  const patched = service.patchOfficialAssetData(
+    `${PATCHED_OFFICIAL_PREFIX}assets/app-shared-owner-test.js`,
+    Buffer.from(source),
+    { headers: { host: "example.com" } }
+  ).toString("utf8");
+
+  // 隐藏 renderer 仍尊重官方的 queued-message 开关，但不因窗口不可见而丢失 owner。
+  assert.match(patched, /opencodexHiddenRendererThreadOwnership/);
+  assert.match(patched, /canAcquireThreadStream:!ppn\(\)&&nzn\(\{isHotkeyWindow:false,isWindowActive:true\}\)/);
+  assert.doesNotMatch(patched, /isWindowActive:e===`visible`&&document\.hasFocus\(\)/);
+});
+
+test("new thread snapshots cannot demote the creating renderer", (t) => {
+  const webviewDir = makeOfficialWebviewDir(t);
+  const service = createService(webviewDir);
+  const source =
+    "function threadStreamStateChanged(e,t,n){} function x(e,t,n){if(!this.followedConversationIds.has(e))return;let r=this.getStreamRole(e);if(r?.role===`owner`&&t.type!==`snapshot`)return;if(t.type===`snapshot`){this.setConversationStreamRole(e,{role:`follower`,ownerClientId:n})}}";
+  const patched = service.patchOfficialAssetData(
+    `${PATCHED_OFFICIAL_PREFIX}assets/app-shared-snapshot-test.js`,
+    Buffer.from(source),
+    { headers: { host: "example.com" } }
+  ).toString("utf8");
+
+  assert.match(patched, /opencodexNewThreadSnapshotOwnership/);
+  assert.match(patched, /threadStore\.getConversation\(e\)\?\.threadStartKind/);
+});
+
 test("large official renderer patches complete off the gateway event loop", async (t) => {
   const webviewDir = makeOfficialWebviewDir(t);
   const assetsDir = path.join(webviewDir, "assets");

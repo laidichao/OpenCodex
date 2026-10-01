@@ -1,6 +1,8 @@
 const childProcess = require("child_process");
+const crypto = require("node:crypto");
 const electron = require("electron");
 const fs = require("fs");
+const net = require("node:net");
 const os = require("os");
 const path = require("path");
 const util = require("util");
@@ -64,10 +66,17 @@ let runtimeCompatibility = null;
 let removeWsClientReadyListener = null;
 // 官方 runtime 会把自身 TMPDIR 改到隔离目录；observer 必须在此之前记住原始 fallback socket。
 const ORIGINAL_SYSTEM_TMPDIR = os.tmpdir();
+const OFFICIAL_WINDOWS_IPC_PIPE = "\\\\.\\pipe\\codex-ipc";
+let officialWindowsIpcPipeIsolationInstalled = false;
+
+function officialWindowsIpcPipePath() {
+  const runtimeHash = crypto.createHash("sha256").update(RUNTIME_DIR).digest("hex").slice(0, 12);
+  return `\\\\.\\pipe\\codex-ipc-${runtimeHash}`;
+}
 
 function officialDesktopIpcSocketPaths(platform = process.platform) {
   // Windows 的 Node IPC 使用 named pipe；Unix socket 路径在该平台不会建立连接。
-  if (platform === "win32") return ["\\\\.\\pipe\\codex-ipc"];
+  if (platform === "win32") return [officialWindowsIpcPipePath()];
   const uid =
     typeof process.getuid === "function"
       ? String(process.getuid())
@@ -76,6 +85,39 @@ function officialDesktopIpcSocketPaths(platform = process.platform) {
     path.join(CODEX_HOME, "ipc", "ipc.sock"),
     path.join(ORIGINAL_SYSTEM_TMPDIR, "codex-ipc", `ipc-${uid}.sock`),
   ];
+}
+
+function remapOfficialWindowsIpcPipe(value) {
+  return process.platform === "win32" && value === OFFICIAL_WINDOWS_IPC_PIPE
+    ? officialWindowsIpcPipePath()
+    : value;
+}
+
+function installOfficialWindowsIpcPipeIsolation() {
+  if (process.platform !== "win32" || officialWindowsIpcPipeIsolationInstalled) return false;
+  const serverPrototype = net.Server?.prototype;
+  if (!serverPrototype || typeof serverPrototype.listen !== "function") return false;
+  const originalListen = serverPrototype.listen;
+  const originalCreateConnection = net.createConnection;
+  const originalConnect = net.connect;
+  serverPrototype.listen = function isolatedOfficialIpcListen(...args) {
+    if (typeof args[0] === "string") args[0] = remapOfficialWindowsIpcPipe(args[0]);
+    return originalListen.apply(this, args);
+  };
+  net.createConnection = function isolatedOfficialIpcCreateConnection(...args) {
+    if (typeof args[0] === "string") args[0] = remapOfficialWindowsIpcPipe(args[0]);
+    return originalCreateConnection.apply(this, args);
+  };
+  net.connect = function isolatedOfficialIpcConnect(...args) {
+    if (typeof args[0] === "string") args[0] = remapOfficialWindowsIpcPipe(args[0]);
+    return originalConnect.apply(this, args);
+  };
+  officialWindowsIpcPipeIsolationInstalled = true;
+  diagnosticLog("official-runtime", "windows_ipc_pipe_isolated", {
+    officialPipe: OFFICIAL_WINDOWS_IPC_PIPE,
+    isolatedPipe: officialWindowsIpcPipePath(),
+  });
+  return true;
 }
 
 const officialLiveObserver = createOfficialLiveObserver({
@@ -2650,6 +2692,8 @@ function startOfficialRuntime(options = {}) {
     patchOfficialAppSingleton
   );
 
+  // 官方 bundle 在 Windows 仍使用固定 codex-ipc；加载前把它映射到当前运行目录专属 pipe，避免多实例串线。
+  installOfficialWindowsIpcPipeIsolation();
   // 官方 bootstrap 负责注册 IPC handler、创建隐藏 BrowserWindow 和启动自己的 app-server 连接。
   require(officialBundle.bootstrapPath);
   const electronModuleStatus = officialElectronModuleHookStatus();
@@ -2703,6 +2747,9 @@ module.exports = {
     normalizeInitialSidebarBootstrap,
     OfficialChunkedMessageReceiver,
     officialDesktopIpcSocketPaths,
+    officialWindowsIpcPipePath,
+    remapOfficialWindowsIpcPipe,
+    installOfficialWindowsIpcPipeIsolation,
     outgoingWsEnvelope,
     routeIdFromValue,
     routeOfficialWebContentsSend,

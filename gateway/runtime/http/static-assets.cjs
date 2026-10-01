@@ -33,7 +33,7 @@ const PATCHED_ASSET_CACHE_MAX_BYTES = Math.max(
     ? configuredPatchedAssetCacheMaxBytes
     : 96 * 1024 * 1024
 );
-const PATCHED_ASSET_PATCH_REVISION = "14";
+const PATCHED_ASSET_PATCH_REVISION = "18";
 const ASYNC_PATCH_MIN_BYTES = 512 * 1024;
 const OFFICIAL_ASSET_PATCH_WORKER_IDLE_MS = 30_000;
 const OFFICIAL_ASSET_PATCH_WORKER_PATH = path.join(__dirname, "official-asset-patch-worker.cjs");
@@ -1347,6 +1347,61 @@ ${pluginGatewayStateBootstrapScript()}
     );
   }
 
+  function patchNewThreadResumeRace(source) {
+    /**
+     * 新线程只有 thread/start 占位信息时还没有可恢复的 rollout，官方恢复流程不能提前调用
+     * thread/resume；提前恢复会收到 no rollout found，并阻断首条 turn/start。官方用
+     * threadStartKind=default 标记这类占位线程；已有历史线程不带该标记，仍完整执行 hydration 和 resume。
+     * 页面内可能并发触发多次恢复，因此用一次性集合在状态写入生效前也阻止重复 resume。
+     */
+    const marker = "threadResumeRaceGuard";
+    if (source.includes(marker)) return source;
+    const preamble =
+      /(let\{conversationId:([A-Za-z_$][\w$]*),[\s\S]*?\}=([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.getConversation\(\2\),([A-Za-z_$][\w$]*)=\5\.getHostId\(\),([A-Za-z_$][\w$]*)=\5\.getWindowActivity\(\),([A-Za-z_$][\w$]*)=\7\?\.visibilityState;)/;
+    const match = preamble.exec(source);
+    if (!match) return source;
+    const conversationId = match[2];
+    const manager = match[5];
+    const conversation = match[4];
+    const guard =
+      `/*${marker}*/globalThis.__opencodexThreadResumeGuards??=new Set;if(${conversation}?.resumeState===\`needs_resume\`&&${conversation}?.threadStartKind&&!globalThis.__opencodexThreadResumeGuards.has(${conversationId})){globalThis.__opencodexThreadResumeGuards.add(${conversationId});${manager}.updateConversationState(${conversationId},e=>{e.resumeState=\`resumed\`});${manager}.ensureRecentConversationId(${conversationId});return{status:\`ready\`}}`;
+    return `${source.slice(0, match.index + match[0].length)}${guard}${source.slice(match.index + match[0].length)}`;
+  }
+
+  function patchHiddenRendererThreadOwnership(source) {
+    /**
+     * 远端 Web 的请求由隐藏 renderer 代发；隐藏窗口本身不可见且没有焦点时，
+     * 官方会把它判定为不能获取 thread stream owner，随后把刚创建的线程降为 follower，
+     * 导致首条 turn/start 收到“请回到创建窗口继续”的错误。远端网关已经是该窗口的唯一执行端，
+     * 因此只放宽这一项 owner 能力判断，仍保留官方的 queued-message 禁用条件。
+     */
+    const marker = "opencodexHiddenRendererThreadOwnership";
+    if (source.includes(marker)) return source;
+    const ownershipCheck =
+      /(canAcquireThreadStream:!ppn\(\)&&nzn\(\{isHotkeyWindow:ezn\(\),isWindowActive:e===`visible`&&document\.hasFocus\(\)\}\))/;
+    if (!ownershipCheck.test(source)) return source;
+    return source.replace(
+      ownershipCheck,
+      "/*opencodexHiddenRendererThreadOwnership*/canAcquireThreadStream:!ppn()&&nzn({isHotkeyWindow:false,isWindowActive:true})"
+    );
+  }
+
+  function patchNewThreadSnapshotOwnership(source) {
+    /**
+     * 新线程尚未 materialize 时，其他 renderer 的 snapshot 可能先于首条 turn/start 到达。
+     * 官方会把当前 owner 降为 follower，随后首条消息被路由到不存在的外部 owner；新线程应继续由创建它的 renderer 保持 owner。
+     */
+    const marker = "opencodexNewThreadSnapshotOwnership";
+    if (source.includes(marker)) return source;
+    const snapshotGuard =
+      /(followedConversationIds\.has\(([\w$]+)\)[\s\S]*?if\()([\w$]+)(\?\.role===`owner`&&)([\w$]+)(\.type!==`snapshot`\)return;)/;
+    if (!snapshotGuard.test(source)) return source;
+    return source.replace(
+      snapshotGuard,
+      "$1$3$4/*opencodexNewThreadSnapshotOwnership*/($5.type!==`snapshot`||this.params.threadStore.getConversation($2)?.threadStartKind))return;"
+    );
+  }
+
   function downloadFileMessage() {
     const messages = currentHostI18n().messages || {};
     return messages[OPENCODEX_DOWNLOAD_FILE_MESSAGE_ID] || "Download file";
@@ -1594,6 +1649,8 @@ ${pluginGatewayStateBootstrapScript()}
       data.includes(APP_SERVER_REQUEST_CLIENT_DISPATCH_ERROR) ||
       data.includes("/wham/statsig/bootstrap") ||
       data.includes("threadStreamStateChanged(") ||
+      data.includes("maybe_resume_started") ||
+      data.includes("canAcquireThreadStream:!ppn()") ||
       data.includes(".safeGet(`/me`,") ||
       (!loopback &&
         (data.includes(OPEN_IN_FOLDER_LOCALE_TOKEN) ||
@@ -1612,6 +1669,12 @@ ${pluginGatewayStateBootstrapScript()}
     let patched = isHistorySignalsChunk
       ? patchHistorySignalsCompatible(source)
       : source;
+    // 新建线程的占位状态不能提前走 thread/resume，否则首条消息会被官方错误处理阻断。
+    patched = patchNewThreadResumeRace(patched);
+    // 隐藏 renderer 负责远端 Web 的唯一执行链，必须能够稳定取得新线程 owner。
+    patched = patchHiddenRendererThreadOwnership(patched);
+    // 新线程的首个 snapshot 不能抢走本地创建 renderer 的 owner。
+    patched = patchNewThreadSnapshotOwnership(patched);
     patched = patchApplicationMenuCompatible(patched);
     patched = patchRequestSchedulingCompatible(patched);
     // 将新版 AppHost 初始化接回已有 Web Provider，避免启动阶段请求无法被本地处理。
