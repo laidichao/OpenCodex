@@ -473,6 +473,33 @@
       .entry-version span {
         display: block;
       }
+      .boot-progress {
+        display: grid;
+        gap: 7px;
+        margin-top: 14px;
+      }
+      .boot-progress[hidden] {
+        display: none;
+      }
+      .boot-progress-track {
+        height: 6px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: rgba(26, 28, 31, 0.1);
+      }
+      .boot-progress-value {
+        width: 0%;
+        height: 100%;
+        border-radius: inherit;
+        background: var(--color-token-button-background, #1a1c1f);
+        transition: width 160ms ease;
+      }
+      .boot-progress-label {
+        color: #6b7280;
+        font-size: var(--text-xs, 11px);
+        line-height: 16px;
+        text-align: right;
+      }
       @media (prefers-reduced-motion: reduce) {
         .settings-backdrop,
         .settings-sidebar {
@@ -535,6 +562,10 @@
             <div id="error" class="error"></div>
           </form>
           <p id="hint" class="hint hidden" data-i18n="web.auth.starting">正在启动 OpenCodex...</p>
+          <div id="boot-progress" class="boot-progress" hidden aria-live="polite">
+            <div class="boot-progress-track"><div id="boot-progress-value" class="boot-progress-value"></div></div>
+            <span id="boot-progress-label" class="boot-progress-label">0%</span>
+          </div>
         </section>
       </main>
       <div class="entry-version">
@@ -615,6 +646,9 @@
         const root = document.getElementById("root");
         const status = document.getElementById("status");
         const hint = document.getElementById("hint");
+        const bootProgress = document.getElementById("boot-progress");
+        const bootProgressValue = document.getElementById("boot-progress-value");
+        const bootProgressLabel = document.getElementById("boot-progress-label");
         const form = document.getElementById("login-form");
         const passwordInput = document.getElementById("password");
         const submit = document.getElementById("submit");
@@ -911,10 +945,18 @@
           passwordInput.focus();
         }
 
-        function showBoot(message) {
+        function setBootProgress(progress) {
+          const value = Math.max(0, Math.min(100, Math.round(Number(progress) || 0)));
+          bootProgress.hidden = false;
+          bootProgressValue.style.width = `${value}%`;
+          bootProgressLabel.textContent = `${value}%`;
+        }
+
+        function showBoot(message, progress = 8) {
           status.textContent = message;
           form.classList.add("hidden");
           hint.classList.remove("hidden");
+          setBootProgress(progress);
         }
 
         async function authStatus(options = {}) {
@@ -1043,9 +1085,10 @@
         }
 
         async function bootRenderer() {
-          showBoot(t("web.auth.starting"));
+          showBoot(t("web.auth.starting"), 8);
           const res = await fetch("/official-index.patched.html", {
-            cache: "no-store",
+            // 入口 HTML 使用私有短缓存；Authorization/Cookie 由服务端 Vary 隔离不同设备和账号。
+            cache: "default",
             credentials: "same-origin",
             headers: authHeaders({ accept: "text/html" }),
           });
@@ -1055,11 +1098,38 @@
             return;
           }
           if (!res.ok) throw new Error(t("web.auth.loadFailedHttp", { status: res.status }));
-          const html = await res.text();
+          let html = "";
+          if (res.body && typeof res.body.getReader === "function") {
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            const total = Number(res.headers.get("content-length")) || 0;
+            let loaded = 0;
+            const chunks = [];
+            while (true) {
+              const part = await reader.read();
+              if (part.done) break;
+              chunks.push(part.value);
+              loaded += part.value.byteLength;
+              // 没有 Content-Length 时保持在 85%，避免把网络读取误报为已完成。
+              setBootProgress(total > 0 ? 12 + (loaded / total) * 73 : Math.min(85, 18 + loaded / 8192));
+            }
+            const bytes = new Uint8Array(chunks.reduce((size, chunk) => size + chunk.length, 0));
+            let offset = 0;
+            for (const chunk of chunks) {
+              bytes.set(chunk, offset);
+              offset += chunk.length;
+            }
+            html = decoder.decode(bytes);
+          } else {
+            html = await res.text();
+            setBootProgress(85);
+          }
+          setBootProgress(92);
           try {
             sessionStorage.setItem("opencodex_legacy_document_replace_hit", "1");
           } catch {}
           document.open();
+          setBootProgress(100);
           document.write(html);
           document.close();
         }

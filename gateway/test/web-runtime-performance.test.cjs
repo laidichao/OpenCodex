@@ -388,6 +388,8 @@ test("sidebar preview exposes loading and retry feedback while history content i
   assert.match(SIDEBAR_PREVIEW_SOURCE, /历史会话加载超时/);
   assert.match(SIDEBAR_PREVIEW_SOURCE, /data-opencodex-history-retry/);
   assert.match(SIDEBAR_PREVIEW_SOURCE, /historyContentReady/);
+  assert.match(SIDEBAR_PREVIEW_SOURCE, /data-opencodex-history-progress-value/);
+  assert.match(SIDEBAR_PREVIEW_SOURCE, /正在切换到会话 18%/);
 });
 
 test("sidebar preview leaves no observer or timer behind when history is empty", () => {

@@ -489,6 +489,15 @@ test("web shell keeps restart controls visible, recoverable and bound to a new g
   assert.match(html, /env\(safe-area-inset-bottom, 0px\)/);
 });
 
+test("web shell shows boot progress while loading the remote renderer", () => {
+  const html = fs.readFileSync(WEB_SHELL_INDEX, "utf-8");
+
+  assert.match(html, /id="boot-progress" class="boot-progress"/);
+  assert.match(html, /cache: "default"/);
+  assert.match(html, /res\.body && typeof res\.body\.getReader === "function"/);
+  assert.match(html, /setBootProgress\(total > 0/);
+});
+
 test("bridge keeps synchronous official preload methods out of the adaptive IPC fallback", () => {
   const source = fs.readFileSync(BRIDGE_POLYFILL, "utf-8");
 
@@ -1824,6 +1833,16 @@ test("only caches content-hashed patched assets as immutable", (t) => {
   assert.match(dynamic.body.toString("utf-8"), /下载文件/);
   assert.equal(fixedName.headers["cache-control"], "no-store");
   assert.equal(legacy.headers["cache-control"], "no-store");
+});
+
+test("renderer entry uses a short private cache to reduce repeat relay downloads", (t) => {
+  const service = createService(makeOfficialWebviewDir(t));
+  const response = makeResponseRecorder();
+  service.serveRendererIndex({ headers: { "accept-encoding": "identity" } }, response);
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers["cache-control"], "private, max-age=30, stale-while-revalidate=300");
+  assert.equal(response.headers.vary, "Accept-Encoding, Authorization, Cookie");
 });
 
 test("patched asset cache coalesces asynchronous compression and reuses it for ETag validation", async (t) => {

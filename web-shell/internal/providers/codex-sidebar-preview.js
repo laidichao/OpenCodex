@@ -26,9 +26,11 @@
   let readyFrame = null;
   let historyLoadingCheckTimer = null;
   let historyLoadingTimeoutTimer = null;
+  let historyLoadingProgressTimer = null;
   let disposeHistoryLoadingObservation = null;
   let historyLoadingInitialText = "";
   let handoffFallbackTimer = null;
+  let historyLoadingProgress = 8;
 
   function scheduleLateModulePreloads() {
     const markers = Array.from(
@@ -79,6 +81,8 @@
       #${HISTORY_LOADING_ID}{position:fixed;top:0;right:0;bottom:0;left:340px;z-index:20;display:grid;place-items:center;background:color-mix(in srgb,var(--background-primary,#171717) 92%,transparent);pointer-events:auto}
       #${HISTORY_LOADING_ID} [data-opencodex-history-loading-panel]{display:flex;min-width:220px;flex-direction:column;align-items:center;gap:12px;border:1px solid color-mix(in srgb,var(--border-default,#555) 35%,transparent);border-radius:12px;background:color-mix(in srgb,var(--background-primary,#171717) 96%,transparent);padding:20px 24px;color:var(--text-primary,#ececec);box-shadow:0 8px 32px rgb(0 0 0 / 18%)}
       #${HISTORY_LOADING_ID} [data-opencodex-history-loading-spinner]{width:22px;height:22px;border:3px solid color-mix(in srgb,currentColor 22%,transparent);border-top-color:currentColor;border-radius:50%;animation:opencodex-history-loading-spin .8s linear infinite}
+      #${HISTORY_LOADING_ID} [data-opencodex-history-progress-track]{width:220px;height:6px;overflow:hidden;border-radius:999px;background:color-mix(in srgb,currentColor 16%,transparent)}
+      #${HISTORY_LOADING_ID} [data-opencodex-history-progress-value]{display:block;width:8%;height:100%;border-radius:inherit;background:currentColor;transition:width .18s ease}
       #${HISTORY_LOADING_ID} [data-opencodex-history-retry]{border:0;border-radius:7px;background:var(--background-secondary,#333);padding:6px 12px;color:inherit;cursor:pointer}
       @keyframes opencodex-history-loading-spin{to{transform:rotate(360deg)}}
     `;
@@ -88,9 +92,11 @@
   function stopHistoryLoadingWatch() {
     if (historyLoadingCheckTimer) scheduler.clearTimeout(historyLoadingCheckTimer);
     if (historyLoadingTimeoutTimer) scheduler.clearTimeout(historyLoadingTimeoutTimer);
+    if (historyLoadingProgressTimer) scheduler.clearTimeout(historyLoadingProgressTimer);
     disposeHistoryLoadingObservation?.();
     historyLoadingCheckTimer = null;
     historyLoadingTimeoutTimer = null;
+    historyLoadingProgressTimer = null;
     disposeHistoryLoadingObservation = null;
     historyLoadingInitialText = "";
   }
@@ -111,9 +117,32 @@
     return Boolean(messageNode) || text.trim().length > historyLoadingInitialText.trim().length + 32;
   }
 
+  function updateHistoryLoadingProgress(progress, label) {
+    const loading = historyLoadingElement();
+    if (!loading) return;
+    const value = Math.max(0, Math.min(100, Math.round(Number(progress) || 0)));
+    historyLoadingProgress = Math.max(historyLoadingProgress, value);
+    const bar = loading.querySelector?.("[data-opencodex-history-progress-value]");
+    const text = loading.querySelector?.("[data-opencodex-history-progress-label]");
+    if (bar) bar.style.width = `${historyLoadingProgress}%`;
+    if (text) text.textContent = label || `正在加载历史会话 ${historyLoadingProgress}%`;
+  }
+
+  function scheduleHistoryLoadingProgress() {
+    if (historyLoadingProgressTimer || !historyLoadingElement()) return;
+    historyLoadingProgressTimer = scheduler.setTimeout(() => {
+      historyLoadingProgressTimer = null;
+      if (!historyLoadingElement()) return;
+      updateHistoryLoadingProgress(Math.min(92, historyLoadingProgress + 4));
+      scheduleHistoryLoadingProgress();
+    }, 500);
+  }
+
   function setHistoryLoadingTimeout() {
     const loading = historyLoadingElement();
     if (!loading) return;
+    if (historyLoadingProgressTimer) scheduler.clearTimeout(historyLoadingProgressTimer);
+    historyLoadingProgressTimer = null;
     loading.innerHTML = `<div data-opencodex-history-loading-panel role="alert"><span>历史会话加载超时</span><button type="button" data-opencodex-history-retry>重试</button></div>`;
   }
 
@@ -121,6 +150,7 @@
     historyLoadingCheckTimer = null;
     if (!historyLoadingElement()) return;
     if (historyContentReady()) {
+      updateHistoryLoadingProgress(100, "历史会话加载完成");
       clearHistoryLoading();
       return;
     }
@@ -141,10 +171,12 @@
       loading.id = HISTORY_LOADING_ID;
       loading.setAttribute("role", "status");
       loading.setAttribute("aria-live", "polite");
-      loading.innerHTML = `<div data-opencodex-history-loading-panel><span data-opencodex-history-loading-spinner aria-hidden="true"></span><span>正在加载历史会话…</span></div>`;
+      loading.innerHTML = `<div data-opencodex-history-loading-panel><span data-opencodex-history-loading-spinner aria-hidden="true"></span><span data-opencodex-history-progress-label>正在加载历史会话 8%</span><div data-opencodex-history-progress-track><span data-opencodex-history-progress-value></span></div></div>`;
       // 覆盖层独立挂在 body，避免向官方 React 的 main 子树注入节点后改变其挂载判断。
       document.body?.appendChild(loading);
     }
+    historyLoadingProgress = 8;
+    updateHistoryLoadingProgress(8);
     stopHistoryLoadingWatch();
     disposeHistoryLoadingObservation = adapterHost.dom.observe({
       key: {},
@@ -153,6 +185,7 @@
       callback: checkHistoryContent,
     });
     historyLoadingTimeoutTimer = scheduler.setTimeout(setHistoryLoadingTimeout, MAX_LIFETIME_MS);
+    scheduleHistoryLoadingProgress();
     checkHistoryContent();
   }
 
@@ -254,6 +287,7 @@
     row.setAttribute("aria-busy", "true");
     // 官方切换历史会话期间主区域可能暂时没有任何 turn；先给用户明确反馈，避免出现整页空白。
     showHistoryLoading();
+    updateHistoryLoadingProgress(18, "正在切换到会话 18%");
     checkDelayMs = 16;
     // 常态首屏只做低频轮询；用户已经提前选择会话时才临时观察 DOM，兼顾低功耗和快速交接。
     observeOfficialSidebar();

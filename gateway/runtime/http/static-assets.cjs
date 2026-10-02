@@ -1899,10 +1899,15 @@ ${pluginGatewayStateBootstrapScript()}
         "Official renderer bundle is not available yet."
       );
     }
-    // renderer HTML 引用动态配置和带版本的静态资源；入口本身不缓存，升级后刷新即可切换新 bundle。
+    // renderer HTML 含当前会话快照，使用私有短缓存降低远端重复打开的带宽；版本化静态资源仍负责升级后的缓存失效。
     const response = gzipIfUseful(
       req,
-      { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", ...headers },
+      {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "private, max-age=30, stale-while-revalidate=300",
+        vary: "Accept-Encoding, Authorization, Cookie",
+        ...headers,
+      },
       Buffer.from(html, "utf-8")
     );
     return send(
