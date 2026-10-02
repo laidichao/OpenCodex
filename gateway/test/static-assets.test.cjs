@@ -384,7 +384,7 @@ test("compatibility capabilities preserve renderer HTML output byte for byte", (
   compatibilityService.dispose();
 });
 
-test("renderer loads host locale before official scripts and defers the remaining runtime when safe", (t) => {
+test("renderer loads host locale before official scripts and keeps the bridge synchronous", (t) => {
   const cases = [
     ["module", '<script data-official-case="module" type="module" src="./assets/module.js"></script>', true],
     ["deferred-classic", '<script data-official-case="deferred-classic" defer src="./assets/legacy.js"></script>', true],
@@ -401,7 +401,7 @@ test("renderer loads host locale before official scripts and defers the remainin
       `<html><head>${officialScript}</head><body><div id="root"></div></body></html>`
     );
     const html = createService(webviewDir).createRendererResponse();
-    const deferAttribute = deferred ? " defer" : "";
+    const deferAttribute = "";
     // 配置脚本负责设置官方模块首次读取的语言，因此无论官方脚本类型都必须阻塞解析执行。
     const configScript = '<script src="/codex-web-config.js"></script>';
     const bootstrapScript = `<script${deferAttribute} src="${OPENCODEX_RUNTIME_BOOTSTRAP_PATH}"></script>`;
@@ -570,10 +570,31 @@ test("new thread placeholders skip premature official resume", (t) => {
 
   // 新建占位线程只更新本地恢复状态，已有线程仍保留官方 resume 调用。
   assert.match(patched, /threadResumeRaceGuard/);
-  assert.match(patched, /x\?\.resumeState===`needs_resume`&&x\?\.threadStartKind/);
+  assert.match(
+    patched,
+    /x\?\.resumeState===`needs_resume`&&x\?\.threadStartKind&&x\?\.historyMode==null&&x\?\.sessionId==null&&!x\?\.rolloutPath&&x\?\.turns\?\.length===0&&!x\?\.title/
+  );
   assert.match(patched, /__opencodexThreadResumeGuards/);
   assert.match(patched, /return\{status:`ready`\}/);
   assert.match(patched, /sendRequest\(`thread\/resume`/);
+});
+
+test("writer-conflicted history hydrates as a follower without blocking the page", (t) => {
+  const webviewDir = makeOfficialWebviewDir(t);
+  const service = createService(webviewDir);
+  const source =
+    "async function resume(i){let{conversationId:f}=i,x=e.getConversation(f),g=[`/`],ye=g,be=null,ee=!1,btn=t=>t?.message?.includes(`already has an active writer`),ctn=async()=>{};e.logger.info(`maybe_resume_started`);try{await e.sendRequest(`thread/resume`,{threadId:f})}catch(t){if(!ee&&btn(t)&&be?.thread.historyMode===`paginated`)try{await ctn(e,{conversationId:f,isCurrentResumeAttempt:c,mapThreadTurns:o.mapThreadTurns,requestOptions:ie,thread:be.thread,turnMergePolicy:o.turnMergePolicy,workspaceRoots:ye})}catch(t){e.logger.warning(`Failed to hydrate writer-conflicted thread history`,{safe:{conversationId:f},sensitive:{error:t}})}throw t}}";
+  const patched = service.patchOfficialAssetData(
+    `${PATCHED_OFFICIAL_PREFIX}assets/app-shared-writer-conflict-test.js`,
+    Buffer.from(source),
+    { headers: { host: "example.com" } }
+  ).toString("utf8");
+
+  assert.match(patched, /opencodexWriterConflictHistoryCompatible/);
+  assert.match(patched, /be\?\.thread\?\?\{id:f,historyMode:`paginated`/);
+  assert.match(patched, /setConversationStreamRole\(f,\{role:`follower`,ownerClientId:null\}\)/);
+  assert.match(patched, /opencodexWriterConflictHistorySnapshot/);
+  assert.match(patched, /return\{status:`ready`\}/);
 });
 
 test("hidden renderer keeps thread ownership for relay requests", (t) => {
@@ -597,7 +618,7 @@ test("new thread snapshots cannot demote the creating renderer", (t) => {
   const webviewDir = makeOfficialWebviewDir(t);
   const service = createService(webviewDir);
   const source =
-    "function threadStreamStateChanged(e,t,n){} function x(e,t,n){if(!this.followedConversationIds.has(e))return;let r=this.getStreamRole(e);if(r?.role===`owner`&&t.type!==`snapshot`)return;if(t.type===`snapshot`){this.setConversationStreamRole(e,{role:`follower`,ownerClientId:n})}}";
+    "function threadStreamStateChanged(e,t,n){} function handleThreadStreamStateChanged(e,t,n){if(!this.followedConversationIds.has(e))return;let r=this.getStreamRole(e);if(r?.role===`owner`&&t.type!==`snapshot`)return;if(t.type===`snapshot`){this.setConversationStreamRole(e,{role:`follower`,ownerClientId:n})}}";
   const patched = service.patchOfficialAssetData(
     `${PATCHED_OFFICIAL_PREFIX}assets/app-shared-snapshot-test.js`,
     Buffer.from(source),
@@ -1710,8 +1731,8 @@ test("external plugins require an SDK-compatible ESM v2 entry and never execute 
     assert.match(aggregateSource, /modern-plugin\/entry\.mjs/);
     assert.doesNotMatch(aggregateSource, /must not execute/);
     const html = service.createRendererResponse();
-    const codecIndex = html.indexOf('<script defer src="/codex-app-host-message-codec.js"></script>');
-    const bridgeIndex = html.indexOf('<script defer src="/codex-bridge-polyfill.js"></script>');
+    const codecIndex = html.indexOf('<script src="/codex-app-host-message-codec.js"></script>');
+    const bridgeIndex = html.indexOf('<script src="/codex-bridge-polyfill.js"></script>');
     assert.ok(codecIndex >= 0 && bridgeIndex > codecIndex);
   } finally {
     if (previousRoots === undefined) delete process.env.OPENCODEX_PLUGIN_DIRS;

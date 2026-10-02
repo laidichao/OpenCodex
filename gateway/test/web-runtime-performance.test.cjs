@@ -311,7 +311,10 @@ test("sidebar preview hands off immediately when the official sidebar mounts", (
     getAttribute: () => "thread-1",
     setAttribute() {},
   };
-  const officialRow = { getAttribute: () => "local:thread-1" };
+  const officialRow = {
+    getAttribute: (name) => name === "data-app-action-sidebar-thread-id" ? "local:thread-1" : null,
+    click() {},
+  };
   document.documentElement = {};
   document.head = new TestElement("head");
   document.readyState = "loading";
@@ -323,7 +326,7 @@ test("sidebar preview hands off immediately when the official sidebar mounts", (
       ? [localeMarker, shellMarker]
       : selector === 'link[rel="modulepreload"]'
         ? document.head.children
-        : officialReady
+      : officialReady
           ? [officialRow]
           : [];
   const window = new ListenerTarget();
@@ -370,6 +373,21 @@ test("sidebar preview hands off immediately when the official sidebar mounts", (
   assert.equal(removed, true);
   assert.equal(document.listenerCount("click"), 0);
   assert.doesNotMatch(SIDEBAR_PREVIEW_SOURCE, /SidebarPreviewDiagnostics/);
+});
+
+test("sidebar preview keeps a pending history handoff alive during slow startup", () => {
+  assert.match(SIDEBAR_PREVIEW_SOURCE, /MAX_LIFETIME_MS = 30_000/);
+  assert.match(SIDEBAR_PREVIEW_SOURCE, /用户已点选会话时必须保留交接目标/);
+  assert.match(SIDEBAR_PREVIEW_SOURCE, /scheduleRouteHandoffFallback/);
+  assert.match(SIDEBAR_PREVIEW_SOURCE, /\.\/local\/\$\{encodeURIComponent\(threadId\)\}/);
+});
+
+test("sidebar preview exposes loading and retry feedback while history content is pending", () => {
+  assert.match(SIDEBAR_PREVIEW_SOURCE, /HISTORY_LOADING_ID = "opencodex-history-loading"/);
+  assert.match(SIDEBAR_PREVIEW_SOURCE, /正在加载历史会话/);
+  assert.match(SIDEBAR_PREVIEW_SOURCE, /历史会话加载超时/);
+  assert.match(SIDEBAR_PREVIEW_SOURCE, /data-opencodex-history-retry/);
+  assert.match(SIDEBAR_PREVIEW_SOURCE, /historyContentReady/);
 });
 
 test("sidebar preview leaves no observer or timer behind when history is empty", () => {

@@ -33,7 +33,8 @@ const PATCHED_ASSET_CACHE_MAX_BYTES = Math.max(
     ? configuredPatchedAssetCacheMaxBytes
     : 96 * 1024 * 1024
 );
-const PATCHED_ASSET_PATCH_REVISION = "18";
+// 每次兼容补丁逻辑变化都递增版本，避免运行设备继续命中旧的持久化 renderer 缓存。
+const PATCHED_ASSET_PATCH_REVISION = "20";
 const ASYNC_PATCH_MIN_BYTES = 512 * 1024;
 const OFFICIAL_ASSET_PATCH_WORKER_IDLE_MS = 30_000;
 const OFFICIAL_ASSET_PATCH_WORKER_PATH = path.join(__dirname, "official-asset-patch-worker.cjs");
@@ -337,6 +338,8 @@ function createStaticAssetService({
   const patchedOfficialPrefixes = Array.from(
     new Set([
       PATCHED_OFFICIAL_PREFIX,
+      "/official-patched-v19/",
+      "/official-patched-v18/",
       "/official-patched-v7/",
       "/official-patched-v6/",
       "/official-patched-v5/",
@@ -971,7 +974,8 @@ function createStaticAssetService({
     if (startupPreloads) hitCompatibilityPoint(staticPoints.startupPreload);
     if (previewMarkup) hitCompatibilityPoint(staticPoints.sidebarPreview);
     const useRuntimeBundle = canBundleRuntimeBootstrap();
-    const deferRuntimeScripts = !officialHtmlHasEagerScript(html);
+    // 官方入口本身是 module script；兼容层必须先同步完成桥接，避免入口先执行后永久停在 startup loader。
+    const deferRuntimeScripts = false;
     const runtimeScript = (src) =>
       `<script${deferRuntimeScripts ? " defer" : ""} src="${src}"></script>`;
     // 官方 LocaleResolver 首次读取后会缓存语言；配置脚本须先同步执行，避免中继延迟让模块先选中英文。
@@ -1351,7 +1355,9 @@ ${pluginGatewayStateBootstrapScript()}
     /**
      * 新线程只有 thread/start 占位信息时还没有可恢复的 rollout，官方恢复流程不能提前调用
      * thread/resume；提前恢复会收到 no rollout found，并阻断首条 turn/start。官方用
-     * threadStartKind=default 标记这类占位线程；已有历史线程不带该标记，仍完整执行 hydration 和 resume。
+     * threadStartKind=default 也会被官方补到历史会话摘要，不能单独作为占位判断；历史摘要在
+     * thread/read 前同样可能没有 historyMode，因此还要确认 sessionId、rolloutPath 和标题都为空。
+     * 只有这类尚未 materialize 的本地占位线程才跳过 resume，已有历史仍完整执行 hydration。
      * 页面内可能并发触发多次恢复，因此用一次性集合在状态写入生效前也阻止重复 resume。
      */
     const marker = "threadResumeRaceGuard";
@@ -1364,7 +1370,7 @@ ${pluginGatewayStateBootstrapScript()}
     const manager = match[5];
     const conversation = match[4];
     const guard =
-      `/*${marker}*/globalThis.__opencodexThreadResumeGuards??=new Set;if(${conversation}?.resumeState===\`needs_resume\`&&${conversation}?.threadStartKind&&!globalThis.__opencodexThreadResumeGuards.has(${conversationId})){globalThis.__opencodexThreadResumeGuards.add(${conversationId});${manager}.updateConversationState(${conversationId},e=>{e.resumeState=\`resumed\`});${manager}.ensureRecentConversationId(${conversationId});return{status:\`ready\`}}`;
+      `/*${marker}*/globalThis.__opencodexThreadResumeGuards??=new Set;if(${conversation}?.resumeState===\`needs_resume\`&&${conversation}?.threadStartKind&&${conversation}?.historyMode==null&&${conversation}?.sessionId==null&&!${conversation}?.rolloutPath&&${conversation}?.turns?.length===0&&!${conversation}?.title&&!globalThis.__opencodexThreadResumeGuards.has(${conversationId})){globalThis.__opencodexThreadResumeGuards.add(${conversationId});${manager}.updateConversationState(${conversationId},e=>{e.resumeState=\`resumed\`});${manager}.ensureRecentConversationId(${conversationId});return{status:\`ready\`}}`;
     return `${source.slice(0, match.index + match[0].length)}${guard}${source.slice(match.index + match[0].length)}`;
   }
 
@@ -1393,12 +1399,31 @@ ${pluginGatewayStateBootstrapScript()}
      */
     const marker = "opencodexNewThreadSnapshotOwnership";
     if (source.includes(marker)) return source;
+    // 只从目标方法的参数绑定会话 ID，避免跨方法贪婪匹配后把 snapshot 当成会话对象。
     const snapshotGuard =
-      /(followedConversationIds\.has\(([\w$]+)\)[\s\S]*?if\()([\w$]+)(\?\.role===`owner`&&)([\w$]+)(\.type!==`snapshot`\)return;)/;
+      /(handleThreadStreamStateChanged\(([\w$]+),([\w$]+),([\w$]+)\)\{if\(!this\.followedConversationIds\.has\(\2\)[\s\S]*?if\()([\w$]+)(\?\.role===`owner`&&)([\w$]+)(\.type!==`snapshot`\)return;)/;
     if (!snapshotGuard.test(source)) return source;
     return source.replace(
       snapshotGuard,
-      "$1$3$4/*opencodexNewThreadSnapshotOwnership*/($5.type!==`snapshot`||this.params.threadStore.getConversation($2)?.threadStartKind))return;"
+      (_match, prefix, conversationId, _stateVar, _ownerVar, ownerExpression, ownerCondition, snapshotVar) =>
+        `${prefix}${ownerExpression}${ownerCondition}/*opencodexNewThreadSnapshotOwnership*/(${snapshotVar}.type!==\`snapshot\`||this.params.threadStore.getConversation(${conversationId})?.threadStartKind))return;`
+    );
+  }
+
+  function patchWriterConflictHistoryCompatible(source) {
+    /**
+     * 远端设备打开已有会话时，原设备可能仍持有 writer；官方 resume 会拒绝第二个 writer，
+     * 但同一会话的 thread/turns/list 与 thread/items/list 仍可用于只读历史。读取成功后把远端
+     * renderer 标记为 follower，避免空白页并保持原设备继续承担写入职责。
+     */
+    const marker = "opencodexWriterConflictHistoryCompatible";
+    if (source.includes(marker)) return source;
+    const fallback =
+      /if\(!ee&&btn\(t\)&&be\?\.thread\.historyMode===`paginated`\)try\{await ctn\(e,\{conversationId:f,isCurrentResumeAttempt:c,mapThreadTurns:o\.mapThreadTurns,requestOptions:ie,thread:be\.thread,turnMergePolicy:o\.turnMergePolicy,workspaceRoots:ye\}\)\}catch\(t\)\{e\.logger\.warning\(`Failed to hydrate writer-conflicted thread history`,\{safe:\{conversationId:f\},sensitive:\{error:t\}\}\)\}/;
+    if (!fallback.test(source)) return source;
+    return source.replace(
+      fallback,
+      "if(!ee&&btn(t))try{await ctn(e,{conversationId:f,isCurrentResumeAttempt:c,mapThreadTurns:o.mapThreadTurns,requestOptions:ie,thread:be?.thread??{id:f,historyMode:`paginated`,cwd:x?.cwd??g[0]??`/`,source:null,turns:[]},turnMergePolicy:o.turnMergePolicy,workspaceRoots:ye});if(c()){e.updateConversationState(f,e=>{e.historyMode=e.historyMode??`paginated`;e.resumeState=`resumed`});e.setConversationStreamRole(f,{role:`follower`,ownerClientId:null});e.ensureRecentConversationId(f);/*opencodexWriterConflictHistorySnapshot*/e.broadcastConversationSnapshot(f);return{status:`ready`}}}catch(t){e.logger.warning(`Failed to hydrate writer-conflicted thread history`,{safe:{conversationId:f},sensitive:{error:t}})}/*opencodexWriterConflictHistoryCompatible*/"
     );
   }
 
@@ -1675,6 +1700,8 @@ ${pluginGatewayStateBootstrapScript()}
     patched = patchHiddenRendererThreadOwnership(patched);
     // 新线程的首个 snapshot 不能抢走本地创建 renderer 的 owner。
     patched = patchNewThreadSnapshotOwnership(patched);
+    // 已有设备持有 writer 时，远端只读历史并进入 follower，避免 resume 错误阻断会话展示。
+    patched = patchWriterConflictHistoryCompatible(patched);
     patched = patchApplicationMenuCompatible(patched);
     patched = patchRequestSchedulingCompatible(patched);
     // 将新版 AppHost 初始化接回已有 Web Provider，避免启动阶段请求无法被本地处理。
