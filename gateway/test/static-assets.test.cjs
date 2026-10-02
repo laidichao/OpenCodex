@@ -1843,6 +1843,11 @@ test("renderer entry uses a short private cache to reduce repeat relay downloads
   assert.equal(response.status, 200);
   assert.equal(response.headers["cache-control"], "private, max-age=30, stale-while-revalidate=300");
   assert.equal(response.headers.vary, "Accept-Encoding, Authorization, Cookie");
+
+  const compressed = makeResponseRecorder();
+  service.serveRendererIndex({ headers: { "accept-encoding": "gzip" } }, compressed);
+  assert.equal(compressed.headers["content-encoding"], "gzip");
+  assert.equal(compressed.headers.vary, "Accept-Encoding, Authorization, Cookie");
 });
 
 test("patched asset cache coalesces asynchronous compression and reuses it for ETag validation", async (t) => {
