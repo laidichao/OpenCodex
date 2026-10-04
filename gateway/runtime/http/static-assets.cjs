@@ -34,7 +34,7 @@ const PATCHED_ASSET_CACHE_MAX_BYTES = Math.max(
     : 96 * 1024 * 1024
 );
 // 每次兼容补丁逻辑变化都递增版本，避免运行设备继续命中旧的持久化 renderer 缓存。
-const PATCHED_ASSET_PATCH_REVISION = "20";
+const PATCHED_ASSET_PATCH_REVISION = "21";
 const ASYNC_PATCH_MIN_BYTES = 512 * 1024;
 const OFFICIAL_ASSET_PATCH_WORKER_IDLE_MS = 30_000;
 const OFFICIAL_ASSET_PATCH_WORKER_PATH = path.join(__dirname, "official-asset-patch-worker.cjs");
@@ -1607,10 +1607,16 @@ ${pluginGatewayStateBootstrapScript()}
 
   /** 只改写官方 Statsig 的两个网络入口，普通 AppHost 请求继续沿用官方 RPC。 */
   function patchStatsigBootstrap(source) {
-    // 登录后 safePost 绕过 window.fetch；启用 Web Provider 时改为相同的本地配置响应。
+    // 登录后先保留本地兼容配置，再经官方 AppHost 异步读取真实导航评估，避免依赖已被删除的磁盘缓存。
     let patched = source.replace(
-      /([A-Za-z_$][\w$]*\.safePost\(`\/wham\/statsig\/bootstrap`,\{requestBody:([A-Za-z_$][\w$]*),retry:!1,signal:([A-Za-z_$][\w$]*)\}\))/g,
-      "(window.__opencodexStatsigBootstrap?window.__opencodexStatsigBootstrap($2,$3):$1)"
+      /(([A-Za-z_$][\w$]*)\.safePost\(`\/wham\/statsig\/bootstrap`,\{requestBody:([A-Za-z_$][\w$]*),retry:!1,signal:([A-Za-z_$][\w$]*)\}\))/g,
+      (_match, call, client, request, signal) =>
+        `(window.__opencodexStatsigBootstrap?window.__opencodexStatsigBootstrap(${request},${signal},(request,signal)=>${client}.safePost(\`/wham/statsig/bootstrap\`,{requestBody:request,retry:!1,signal})): ${call})`
+    );
+    // 官方同步初始化后把 SDK 实例交回桥接层；延迟到达的导航评估通过 SDK 正常事件更新 React。
+    patched = patched.replace(
+      /([\w$]+\.dataAdapter\.setData\([\w$]+\.statsigPayload\),[\w$]+\(([\w$]+)\.initializeSync\(\),`electron`\)),\2\}/g,
+      "$1,window.__opencodexSyncStatsigNavigation?.($2),$2}"
     );
     // SDK 的 networkOverrideFunc 同样走 AppHost；初始化仍交给现有 fetch 拦截器，避免十秒超时。
     patched = patched.replace(

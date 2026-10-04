@@ -67,6 +67,8 @@ let removeWsClientReadyListener = null;
 // 官方 runtime 会把自身 TMPDIR 改到隔离目录；observer 必须在此之前记住原始 fallback socket。
 const ORIGINAL_SYSTEM_TMPDIR = os.tmpdir();
 const OFFICIAL_WINDOWS_IPC_PIPE = "\\\\.\\pipe\\codex-ipc";
+// 保存隔离 hook 安装前的连接入口，确保桌面只读订阅在重连后仍连接真实桌面 pipe。
+const observerCreateConnection = net.createConnection;
 let officialWindowsIpcPipeIsolationInstalled = false;
 
 function officialWindowsIpcPipePath() {
@@ -120,19 +122,39 @@ function installOfficialWindowsIpcPipeIsolation() {
   return true;
 }
 
-const officialLiveObserver = createOfficialLiveObserver({
-  socketPaths: officialDesktopIpcSocketPaths(),
-  publish(payload) {
-    if (wsHub) wsHub.broadcast(payload, { suppressDiagnostic: true });
-    // peer snapshot 也会改变 recent-conversations-meta；沿用官方 renderer 的 invalidation 协议。
-    scheduleThreadListEventSync(payload.channel, [payload.payload]);
-  },
-  onError(error) {
-    diagnosticWarn("official-live-observer", "observer_error", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-  },
-});
+function createRuntimeLiveObserver(socketPaths) {
+  // 两个来源分别维护 owner/revision，只读 following 不改变远端请求的隔离与控制权。
+  return createOfficialLiveObserver({
+    socketPaths,
+    socketFactory(socketPath) {
+      // 绕过只针对隐藏 runtime 的 pipe 重映射，首次连接和重连必须使用同一来源。
+      return observerCreateConnection.call(net, socketPath);
+    },
+    publish(payload) {
+      // Windows 双来源断线已由 observer 发出 owner 级 disconnected，不能全局清空另一来源的 stream。
+      if (process.platform === "win32" && payload.channel === "ipc-connection-reset") return;
+      // 保留官方事件格式，向在线 Web 客户端同步各来源接受的状态。
+      if (wsHub) wsHub.broadcast(payload, { suppressDiagnostic: true });
+      // peer snapshot 也会改变 recent-conversations-meta；沿用官方 renderer 的 invalidation 协议。
+      scheduleThreadListEventSync(payload.channel, [payload.payload]);
+    },
+    onError(error) {
+      diagnosticWarn("official-live-observer", "observer_error", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    },
+  });
+}
+
+// 隐藏 runtime 与官方桌面是同时在线的独立来源，不能把两个 pipe 当成连接失败时的候选路径。
+const officialLiveObservers = [
+  // 保留隔离 runtime 创建的会话状态同步。
+  createRuntimeLiveObserver(officialDesktopIpcSocketPaths()),
+];
+if (process.platform === "win32") {
+  // 补上设备官方桌面的新会话和生成状态，不把控制请求接回桌面 pipe。
+  officialLiveObservers.push(createRuntimeLiveObserver([OFFICIAL_WINDOWS_IPC_PIPE]));
+}
 
 const officialIpc = {
   // 官方 main 调 ipcMain.handle/on 注册的 handler 会被这里记录，再由 HTTP IPC invoke 复用。
@@ -712,7 +734,12 @@ function setWsHub(nextWsHub) {
   // Web config 首次加载可能早于浏览器 WS hello；页面真正注册后再重发一次 following，确保快照不丢。
   removeWsClientReadyListener =
     typeof nextWsHub?.onClientReady === "function"
-      ? nextWsHub.onClientReady(() => officialLiveObserver.refresh())
+      ? nextWsHub.onClientReady(() => {
+          for (const observer of officialLiveObservers) {
+            // Web 重连后向每个来源重新请求完整快照，避免重放旧 revision 的增量。
+            observer.refresh();
+          }
+        })
       : null;
 }
 
@@ -2615,7 +2642,10 @@ async function initialSidebarBootstrapForRenderer() {
     if (effectiveBootstrap) {
       recordRuntimeCompatibilityHit(gatewayPointRefs.initialSidebarBootstrap);
       // 只从 Web 首屏侧栏已知条目订阅，避免 observer 读取或跟踪用户不可见的 thread。
-      officialLiveObserver.observeSidebarBootstrap(effectiveBootstrap);
+      for (const observer of officialLiveObservers) {
+        // 相同可见会话分别订阅桌面和隔离 runtime，状态仍由各来源的 owner 判定。
+        observer.observeSidebarBootstrap(effectiveBootstrap);
+      }
     }
     return effectiveBootstrap;
   } catch (error) {
@@ -2652,7 +2682,12 @@ function startOfficialRuntime(options = {}) {
   );
   runRuntimeCompatibilityCapability(
     gatewayPointRefs.liveObserver,
-    () => officialLiveObserver.start()
+    () => {
+      for (const observer of officialLiveObservers) {
+        // 两个只读来源随 gateway 一起启动，各自保留独立的重连与订阅生命周期。
+        observer.start();
+      }
+    }
   );
   runRuntimeCompatibilityCapability(
     gatewayPointRefs.appServerLaunch,
@@ -2716,7 +2751,10 @@ function startOfficialRuntime(options = {}) {
 function rejectPendingInternalResponses(error) {
   // 当前没有 gateway 自己发起的官方 IPC 请求；保留出口让 shutdown 路径无需关心内部实现。
   void error;
-  officialLiveObserver.stop();
+  for (const observer of officialLiveObservers) {
+    // 关闭所有来源的连接和重连定时器，避免 shutdown 后继续广播旧 owner 状态。
+    observer.stop();
+  }
 }
 
 function listOfficialIpcChannels() {

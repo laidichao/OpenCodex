@@ -1967,12 +1967,65 @@
     };
   }
 
-  // 官方新版 safePost 改走 AppHost RPC；资源补丁在该入口复用现有本地初始化行为。
-  w.__opencodexStatsigBootstrap = async (request, signal) => {
+  let navigationBootstrap = null;
+  // 官方新版 safePost 改走 AppHost RPC；先返回兼容响应，真实导航读取不能阻塞首屏。
+  w.__opencodexStatsigBootstrap = async (request, signal, fetchOfficial) => {
     signal?.throwIfAborted();
     modificationEffects?.statsig?.emit();
+    navigationBootstrap?.controller.abort();
+    navigationBootstrap = null;
+    if (typeof fetchOfficial === "function" && cfg.desktopAccountProfile) {
+      const controller = new AbortController();
+      const timer = scheduler.setTimeout(() => controller.abort(), 30000);
+      const state = { controller, request, profile: cfg.desktopAccountProfile, result: null };
+      navigationBootstrap = state;
+      // 继续使用官方认证及 HTTP 服务，不把令牌传给页面，也不读取其他账号的评估。
+      const pending = Promise.resolve().then(() => fetchOfficial(request, controller.signal));
+      const settled = pending.catch(() => null);
+      state.result = settled.finally(() => scheduler.clearTimeout(timer));
+    }
     // 保留官方 bootstrap 的 user 校验协议，不写入浏览器语言或帐号偏好。
     return buildPostLoginStatsigBootstrap(request);
+  };
+
+  /** 将登录后的真实导航开关应用到当前 SDK，其他兼容配置与执行权限保持不变。 */
+  w.__opencodexSyncStatsigNavigation = async (client) => {
+    const state = navigationBootstrap;
+    if (!state) return;
+    try {
+      const response = await state.result;
+      if (navigationBootstrap !== state || state.controller.signal.aborted || !response?.statsigPayload) return;
+      const payload = JSON.parse(response.statsigPayload);
+      const evaluatedUser = payload.user;
+      const context = client.getContext();
+      const user = context.user;
+      const profile = cfg.desktopAccountProfile;
+      // 同时核对请求、评估和当前 SDK 身份，账号切换或迟到响应不得覆盖新页面。
+      if (!profile || profile.userId !== state.profile.userId || profile.accountId !== state.profile.accountId ||
+          user.userID !== profile.userId || user.customIDs?.account_id !== profile.accountId ||
+          user.custom?.auth_method !== "chatgpt" || evaluatedUser?.custom?.auth_method !== "chatgpt" ||
+          evaluatedUser?.userID !== user.userID || evaluatedUser.customIDs?.account_id !== profile.accountId ||
+          evaluatedUser.customIDs?.stableID !== user.customIDs?.stableID ||
+          user.customIDs?.stableID !== state.request.stable_id ||
+          evaluatedUser.appVersion !== state.request.app_version || evaluatedUser.locale !== state.request.locale ||
+          user.appVersion !== state.request.app_version || user.locale !== state.request.locale) return;
+      // 仅同步已确认控制新旧导航的开关，不把整份官方评估带入 Web 执行设置。
+      const gate = payload.feature_gates?.["3085093835"];
+      if (typeof gate?.value !== "boolean" || !context.values) return;
+      // 同页后续 SDK 刷新仍复用这个已验证布尔值，避免本地初始化响应把导航改回旧版。
+      cfg.desktopFeatureGates = { ...cfg.desktopFeatureGates, "3085093835": gate.value };
+      const values = { ...context.values, user,
+        feature_gates: { ...context.values.feature_gates,
+          "3085093835": { value: gate.value, rule_id: "desktop_bootstrap" } } };
+      client.dataAdapter.setData(JSON.stringify(values));
+      // 使用官方 SDK 的 values_updated 通知驱动导航重渲染，不直接改写 DOM 或强制 gate 为 true。
+      client.updateUserSync(user, { disableBackgroundCacheRefresh: true });
+    } catch {
+      // 官方网络不可用或版本形态变化时保留现有配置，不中断页面与会话。
+    } finally {
+      // 评估消费后释放完整响应；首屏后只保留已校验的导航布尔值。
+      if (navigationBootstrap === state) navigationBootstrap = null;
+    }
   };
 
   // 首屏资料必须属于当前官方登录身份，不能把上一账号的展示信息复用给切换后的账号。
@@ -3927,6 +3980,9 @@
   }
 
   modificationScope?.own?.(() => {
+    // 页面替换时终止尚未完成的导航请求，避免旧实例接收迟到评估。
+    navigationBootstrap?.controller.abort();
+    navigationBootstrap = null;
     settleWsReadyWaiters(false);
     rejectPendingGatewayIpc(new Error("Renderer page was replaced"));
     activeBrowserFilePickerCancel?.();
