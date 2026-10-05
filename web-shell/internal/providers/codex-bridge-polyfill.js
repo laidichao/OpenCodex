@@ -1441,6 +1441,18 @@
 
   /** hidden Electron 代理窗口的 focus 状态不代表浏览器，入站时统一替换为页面真实状态。 */
   function browserRendererMessagePayload(channel, payload) {
+    if (channel === "persisted-atom-sync" && pendingComposerDraftWrites.length > 0) {
+      let value = payload?.state?.[COMPOSER_PROMPT_DRAFTS_KEY];
+      for (const write of pendingComposerDraftWrites) {
+        // 重连的全量快照同样保留尚未确认的草稿增量，不能重新填入已发送内容。
+        value = mergeComposerDraftRecord(value, write.recordUpdate);
+      }
+      return { ...payload, state: { ...payload?.state, [COMPOSER_PROMPT_DRAFTS_KEY]: value } };
+    }
+    if (channel === "persisted-atom-updated" && payload?.key === COMPOSER_PROMPT_DRAFTS_KEY) {
+      // 先确认已落盘的草稿写入，再用尚未确认的新输入或清空操作覆盖迟到快照。
+      return reconcileComposerDraftUpdate(payload);
+    }
     if (channel !== WINDOW_FOCUS_CHANGED_MESSAGE) return payload;
     return {
       ...(payload && typeof payload === "object" ? payload : {}),
@@ -3132,6 +3144,10 @@
 
   const sharedObjectSnapshot = new Map();
   const persistedAtomSnapshot = new Map();
+  const COMPOSER_PROMPT_DRAFTS_KEY = "composer-prompt-drafts-v2";
+  const pendingComposerDraftWrites = [];
+  let composerDraftWriteTail = Promise.resolve();
+  let composerDraftBridgeDisposed = false;
   const PENDING_WORKTREES_KEY = "pending_worktrees";
   const COMPOSER_PERMISSION_MODE_VISIBILITY_KEY = "composer-permission-mode-visibility";
   const DEFAULT_COMPOSER_PERMISSION_MODE_VISIBILITY = {
@@ -3300,6 +3316,81 @@
     emitWindowMessage("persisted-atom-updated", payload);
   }
 
+  /** 合并官方文本草稿的增量记录，null 条目表示删除该会话，其他会话保持原样。 */
+  function mergeComposerDraftRecord(value, recordUpdate) {
+    const merged = new Map(Object.entries(isPlainObject(value) ? value : {}));
+    for (const [key, entry] of Object.entries(recordUpdate.entries)) {
+      if (entry?.updateOnly && !merged.has(key)) continue;
+      if (!entry?.updateOnly) merged.delete(key);
+      if (entry != null) merged.set(key, entry.value);
+    }
+    if (Number.isInteger(recordUpdate.maxEntries) && recordUpdate.maxEntries >= 0) {
+      const excess = merged.size - recordUpdate.maxEntries;
+      for (const key of Array.from(merged.keys()).slice(0, Math.max(0, excess))) merged.delete(key);
+    }
+    return Object.fromEntries(merged);
+  }
+
+  /** 仅串行化文本草稿；发送消息仍使用原通道，失败不会阻止后续清空或恢复写入。 */
+  function forwardComposerDraftUpdate(payload) {
+    const previous = persistedAtomSnapshot.get(payload.key) ??
+      persistedAtomSnapshot.get(payload.recordUpdate.legacyStorageKey);
+    // 页内快照跟随官方增量，不把 recordUpdate 缺省的 value 回显为 null。
+    const value = mergeComposerDraftRecord(previous, payload.recordUpdate);
+    setPersistedAtomSnapshotValue(payload.key, value, false);
+    const queued = pendingComposerDraftWrites.at(-1);
+    if (queued && !queued.sent) {
+      // 公网慢于打字频率时合并未发送增量；同一会话保留最后操作，其他会话增量不丢失。
+      queued.recordUpdate = { ...queued.recordUpdate, ...payload.recordUpdate,
+        entries: { ...queued.recordUpdate.entries, ...payload.recordUpdate.entries } };
+      queued.payload = { ...payload, recordUpdate: queued.recordUpdate };
+      return queued.result;
+    }
+    const write = { payload, recordUpdate: payload.recordUpdate, sent: false, result: null };
+    pendingComposerDraftWrites.push(write);
+    const result = composerDraftWriteTail.then(async () => {
+      if (composerDraftBridgeDisposed) return false;
+      write.sent = true;
+      try {
+        // 等前一次 HTTP 分发完成后再发送，保证旧保存先于提交后的删除到达宿主。
+        return await invoke("codex_desktop:message-from-view", write.payload);
+      } catch (error) {
+        const index = pendingComposerDraftWrites.indexOf(write);
+        if (index >= 0) pendingComposerDraftWrites.splice(index, 1);
+        throw error;
+      }
+    });
+    write.result = result;
+    // 错误仍交给调用方；队列自身消化拒绝，使下一次写入可以继续。
+    composerDraftWriteTail = result.catch(() => undefined);
+    return result;
+  }
+
+  /** 迟到的保存回包不能恢复已清空的编辑器，也不能覆盖用户正在输入的下一条消息。 */
+  function reconcileComposerDraftUpdate(payload) {
+    let value = payload.deleted ? {} : payload.value;
+    const record = isPlainObject(value) ? value : {};
+    let acknowledged = -1;
+    const expectedEntries = new Map();
+    for (let index = 0; index < pendingComposerDraftWrites.length; index += 1) {
+      const write = pendingComposerDraftWrites[index];
+      if (!write.sent) break;
+      for (const [key, entry] of Object.entries(write.recordUpdate.entries)) expectedEntries.set(key, entry);
+      // 确认整个已发送前缀的最终条目，不能仅凭另一会话的相同值跳过尚未落盘的删除。
+      const entries = Array.from(expectedEntries.entries());
+      if (entries.length > 0 && entries.every(([key, entry]) =>
+        entry == null ? !Object.prototype.hasOwnProperty.call(record, key) :
+          JSON.stringify(record[key]) === JSON.stringify(entry.value))) acknowledged = index;
+    }
+    if (acknowledged >= 0) pendingComposerDraftWrites.splice(0, acknowledged + 1);
+    for (const write of pendingComposerDraftWrites) {
+      // 只覆盖待确认条目，宿主快照中的其他会话草稿继续同步。
+      value = mergeComposerDraftRecord(value, write.recordUpdate);
+    }
+    setPersistedAtomSnapshotValue(payload.key, value, !!payload.deleted && pendingComposerDraftWrites.length === 0);
+    return pendingComposerDraftWrites.length === 0 ? payload : { ...payload, value, deleted: false };
+  }
+
   initializePersistedAtomSnapshot();
 
   // 官方 preload 在 renderer 执行前同步记录该时间；Web 侧同样固定为页面 timeOrigin，不能落入异步 IPC。
@@ -3378,6 +3469,10 @@
         }
         if (payload && typeof payload === "object" && payload.type === "persisted-atom-update" && payload.key) {
           modificationEffects?.persistedAtom?.emit();
+          if (payload.key === COMPOSER_PROMPT_DRAFTS_KEY && isPlainObject(payload.recordUpdate?.entries)) {
+            // 官方草稿已经在 renderer 本地更新；只维护快照和有序落盘，不二次回显旧值。
+            return forwardComposerDraftUpdate(payload);
+          }
           // 更新先写本页快照并广播，后续再交给官方 main 按 Desktop 原逻辑落盘。
           const value = setPersistedAtomSnapshotValue(payload.key, payload.value, !!payload.deleted);
           emitPersistedAtomUpdated(payload.key, value, !!payload.deleted);
@@ -3980,6 +4075,9 @@
   }
 
   modificationScope?.own?.(() => {
+    // 页面替换后释放待确认草稿，旧请求不应继续写入新页面实例。
+    composerDraftBridgeDisposed = true;
+    pendingComposerDraftWrites.length = 0;
     // 页面替换时终止尚未完成的导航请求，避免旧实例接收迟到评估。
     navigationBootstrap?.controller.abort();
     navigationBootstrap = null;
