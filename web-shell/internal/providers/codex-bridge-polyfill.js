@@ -3783,6 +3783,10 @@
   subscribe("codex_desktop:system-theme-variant-updated", (value) => {
     if (value === "dark" || value === "light") {
       document.documentElement.dataset.theme = value;
+      // 认证入口首屏读取此值以匹配桌面端最近一次主题选择。
+      try {
+        localStorage.setItem("opencodex_theme", value);
+      } catch {}
     }
   });
   subscribe("shared-object-updated", (message) => {
