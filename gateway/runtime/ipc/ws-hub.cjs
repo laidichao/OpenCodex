@@ -449,7 +449,13 @@ function createWsHub(
         if (!detached || detached.context !== context || context.ws !== ws) return;
         detachedAppHostRelays.delete(key);
         // 超过宽限期仍未重连时释放官方端口，避免永久保留无主 RPC 会话。
-        closeAppHostRelay(detached.relays, context, "detached_timeout", { notify: false });
+        let graceful = false;
+        try {
+          // 异常退出没有 pagehide；超时也先发送 peer-close，让官方 RPC 执行注销。
+          graceful = context.relay?.postMessage(null) === true;
+        } catch {}
+        // 官方 relay 在 null 后异步关闭端口，避免提前销毁导致注销消息丢失。
+        closeAppHostRelay(detached.relays, context, "detached_timeout", { notify: false, closePort: !graceful });
       }, APP_HOST_DETACHED_RELAY_GRACE_MS);
       if (timer && typeof timer.unref === "function") timer.unref();
       detachedAppHostRelays.set(key, { context, relays, timer });
@@ -631,6 +637,15 @@ function createWsHub(
   function hasClient(clientId) {
     const socket = clientsById.get(clientId);
     return !!socket && socket.readyState === socket.OPEN;
+  }
+
+  function hasClients() {
+    // 只计算完成 hello 且仍在线的页面，未握手或已关闭 socket 不应维持 follower。
+    for (const clientId of clientsById.keys()) {
+      // 使用同一定向路由存活判断，避免广播索引和注册索引产生分歧。
+      if (hasClient(clientId)) return true;
+    }
+    return false;
   }
 
   function onClientReady(listener) {
@@ -1121,7 +1136,7 @@ function createWsHub(
     });
   });
 
-  return { broadcast, clients, sendTo, hasClient, onClientReady, onClientRemoved };
+  return { broadcast, clients, sendTo, hasClient, hasClients, onClientReady, onClientRemoved };
 }
 
 module.exports = {

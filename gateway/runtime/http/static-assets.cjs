@@ -34,7 +34,7 @@ const PATCHED_ASSET_CACHE_MAX_BYTES = Math.max(
     : 96 * 1024 * 1024
 );
 // 每次兼容补丁逻辑变化都递增版本，避免运行设备继续命中旧的持久化 renderer 缓存。
-const PATCHED_ASSET_PATCH_REVISION = "21";
+const PATCHED_ASSET_PATCH_REVISION = "24";
 const ASYNC_PATCH_MIN_BYTES = 512 * 1024;
 const OFFICIAL_ASSET_PATCH_WORKER_IDLE_MS = 30_000;
 const OFFICIAL_ASSET_PATCH_WORKER_PATH = path.join(__dirname, "official-asset-patch-worker.cjs");
@@ -338,6 +338,9 @@ function createStaticAssetService({
   const patchedOfficialPrefixes = Array.from(
     new Set([
       PATCHED_OFFICIAL_PREFIX,
+      "/official-patched-v22/",
+      "/official-patched-v21/",
+      "/official-patched-v20/",
       "/official-patched-v19/",
       "/official-patched-v18/",
       "/official-patched-v7/",
@@ -1415,15 +1418,25 @@ ${pluginGatewayStateBootstrapScript()}
      * 远端设备打开已有会话时，原设备可能仍持有 writer；官方 resume 会拒绝第二个 writer，
      * 但同一会话的 thread/turns/list 与 thread/items/list 仍可用于只读历史。读取成功后把远端
      * renderer 标记为 follower，避免空白页并保持原设备继续承担写入职责。
+     * 压缩后的函数和变量名随官方构建变化，必须从历史回退调用中绑定，不能固定某一版名称。
      */
     const marker = "opencodexWriterConflictHistoryCompatible";
     if (source.includes(marker)) return source;
+    // 1. 以官方 writer 冲突历史回退的完整结构定位，保留新版的恢复条件和失败日志。
     const fallback =
-      /if\(!ee&&btn\(t\)&&be\?\.thread\.historyMode===`paginated`\)try\{await ctn\(e,\{conversationId:f,isCurrentResumeAttempt:c,mapThreadTurns:o\.mapThreadTurns,requestOptions:ie,thread:be\.thread,turnMergePolicy:o\.turnMergePolicy,workspaceRoots:ye\}\)\}catch\(t\)\{e\.logger\.warning\(`Failed to hydrate writer-conflicted thread history`,\{safe:\{conversationId:f\},sensitive:\{error:t\}\}\)\}/;
+      /if\((?<condition>(?:![\w$]+&&)?[\w$]+\((?<error>[\w$]+)\))&&(?<snapshot>[\w$]+)\?\.thread\.historyMode===`paginated`\)try\{await (?<hydrate>[\w$]+)\((?<manager>[\w$]+),\{conversationId:(?<conversation>[\w$]+),isCurrentResumeAttempt:(?<isCurrent>[\w$]+),mapThreadTurns:(?<policy>[\w$]+)\.mapThreadTurns,requestOptions:(?<requestOptions>[\w$]+),thread:\k<snapshot>\.thread,turnMergePolicy:\k<policy>\.turnMergePolicy,workspaceRoots:(?<roots>[\w$]+)\}\)\}(?<failure>catch\([\w$]+\)\{\k<manager>\.logger\.warning\(`Failed to hydrate writer-conflicted thread history`,\{safe:\{conversationId:\k<conversation>\},sensitive:\{error:[\w$]+\}\}\)\})/;
     if (!fallback.test(source)) return source;
+
+    // 2. 沿官方协调服务发现持有者并读取历史；有效 follower 后续可发送消息，而不是仅隐藏冲突提示。
     return source.replace(
       fallback,
-      "if(!ee&&btn(t))try{await ctn(e,{conversationId:f,isCurrentResumeAttempt:c,mapThreadTurns:o.mapThreadTurns,requestOptions:ie,thread:be?.thread??{id:f,historyMode:`paginated`,cwd:x?.cwd??g[0]??`/`,source:null,turns:[]},turnMergePolicy:o.turnMergePolicy,workspaceRoots:ye});if(c()){e.updateConversationState(f,e=>{e.historyMode=e.historyMode??`paginated`;e.resumeState=`resumed`});e.setConversationStreamRole(f,{role:`follower`,ownerClientId:null});e.ensureRecentConversationId(f);/*opencodexWriterConflictHistorySnapshot*/e.broadcastConversationSnapshot(f);return{status:`ready`}}}catch(t){e.logger.warning(`Failed to hydrate writer-conflicted thread history`,{safe:{conversationId:f},sensitive:{error:t}})}/*opencodexWriterConflictHistoryCompatible*/"
+      (...args) => {
+        const { condition, snapshot, hydrate, manager, conversation, isCurrent, policy, requestOptions, roots, failure } = args[args.length - 1];
+        // 已收到设备端活跃快照时保留当前 follower 与 revision，不能用分页历史覆盖运行状态。
+        const liveFollower = `if(${isCurrent}()&&${manager}.getStreamRole(${conversation})?.ownerClientId&&${manager}.getStreamRole(${conversation})?.role===\`follower\`&&${manager}.getConversation(${conversation})?.threadRuntimeStatus?.type===\`active\`){${manager}.updateConversationState(${conversation},e=>{e.resumeState=\`resumed\`});return{status:\`ready\`}}`;
+        // 使用官方 owner 身份承接发送并订阅其状态，不让 follower 伪造 owner 快照；发现失败保留原异常。
+        return `if(${condition})try{${liveFollower}const __opencodexOwnerClientId=await window.__opencodexFindThreadOwner?.(${manager},${conversation});await ${hydrate}(${manager},{conversationId:${conversation},isCurrentResumeAttempt:${isCurrent},mapThreadTurns:${policy}.mapThreadTurns,requestOptions:${requestOptions},thread:${snapshot}?.thread??{id:${conversation},historyMode:\`paginated\`,cwd:${manager}.getConversation(${conversation})?.cwd??${roots}?.[0]??\`/\`,source:null,turns:[]},turnMergePolicy:${policy}.turnMergePolicy,workspaceRoots:${roots}});if(${isCurrent}()&&__opencodexOwnerClientId){${manager}.updateConversationState(${conversation},e=>{e.historyMode=e.historyMode??\`paginated\`;e.resumeState=\`resumed\`});${manager}.setConversationStreamRole(${conversation},{role:\`follower\`,ownerClientId:__opencodexOwnerClientId});${manager}.setConversationFollowing(${conversation},true);${manager}.ensureRecentConversationId(${conversation});return{status:\`ready\`}}}${failure}/*${marker}*/`;
+      }
     );
   }
 
@@ -1628,8 +1641,23 @@ ${pluginGatewayStateBootstrapScript()}
 
   /** 把独立 observer 的状态事件交给官方 AppHost 共用的 renderer 分发器。 */
   function patchLiveSidebarState(source) {
-    // 桌面把临时消息移入服务端队列后会广播空队列；follower 必须重新读取真源，不能只清空临时状态。
+    // 新版目录走 AppHost；把实际服务交给桥接层，设备端删除事件才能移除目录条目。
     let patched = source.replace(
+      /([\w$]+\.localThreadCatalog)(?=,[\w$]+,[\w$]+;)/,
+      (_match, service) => `(window.__opencodexInstallThreadCatalog?.(${service},${service.split('.')[0]}.clientCoordination)??${service})`
+    );
+    // 只在恢复历史明确失败时清理不存在的索引，保留原异常让当前打开操作正常失败。
+    patched = patched.replace(
+      /(throw!([\w$]+)\(\)\|\|\(![\w$]+&&[\w$]+\(([\w$]+)\)\?\.includes\(`session \$\{([\w$]+)\} is archived\.`\)&&([\w$]+)\.suppressArchivedConversation\(\4\))/,
+      'if($2())await window.__opencodexRemoveMissingThread?.($5,$4,$3);$1'
+    );
+    // runtime active 覆盖尚未刷新的历史 completed turn；等待子 agent 时不能被历史回包提前结束。
+    patched = patched.replace(
+      /(let\{resumeState:([\w$]+),threadRuntimeStatus:([\w$]+)\}=([\w$]+),([\w$]+)=[\w$]+\(\4\);return )(\2===`needs_resume`\?\3\?\.type===`active`:\5\.length===0\?\2===`resuming`:[\w$]+\(\{turns:\5\}\)\?\.status===`inProgress`)(\})/,
+      '$1$3?.type===`active`||($6)$7'
+    );
+    // 桌面把临时消息移入服务端队列后会广播空队列；follower 必须重新读取真源，不能只清空临时状态。
+    patched = patched.replace(
       /(this\.disposed\|\|([\w$]+)\?\.role!==`follower`\|\|\2\.ownerClientId!==([\w$]+)\)return;)(let ([\w$]+)=this\.pending\.get\(([\w$]+)\.conversationId\);)/,
       '$1this.loadSubscribedMessages($6.conversationId);$4'
     );
@@ -1680,6 +1708,7 @@ ${pluginGatewayStateBootstrapScript()}
       data.includes(APP_SERVER_REQUEST_CLIENT_DISPATCH_ERROR) ||
       data.includes("/wham/statsig/bootstrap") ||
       data.includes("threadStreamStateChanged(") ||
+      data.includes(".localThreadCatalog") ||
       data.includes("maybe_resume_started") ||
       data.includes("canAcquireThreadStream:!ppn()") ||
       data.includes(".safeGet(`/me`,") ||

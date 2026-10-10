@@ -535,6 +535,16 @@
       html[data-theme="dark"] .boot-progress-label {
         color: #a7a7a7;
       }
+      /* 密码入口尚未加载官方主题 Token，设备名与标签必须显式覆盖浅色回退值。 */
+      html[data-theme="dark"] .entry .device-name {
+        color: #ececec;
+      }
+      html[data-theme="dark"] #login-form label {
+        color: #a7a7a7;
+      }
+      html[data-theme="dark"] #error {
+        color: #fca5a5;
+      }
       html[data-theme="dark"] .boot-progress-track {
         background: rgba(255, 255, 255, 0.16);
       }

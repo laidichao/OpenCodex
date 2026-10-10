@@ -86,9 +86,9 @@ function desktopAccountProfileForRenderer() {
   }
 }
 
-/** 只发布当前桌面真实功能布尔值，缓存中的用户信息和完整响应不得进入配置。 */
-function desktopFeatureGatesForRenderer(profile, appVersion, locale) {
-  if (!profile) return {};
+/** 发布当前桌面的导航布尔值和非认证设备 ID，缓存用户信息与完整响应不得进入配置。 */
+function desktopNavigationForRenderer(profile, appVersion, locale) {
+  if (!profile) return { gates: {}, stableId: null };
   // 复用项目的官方数据目录解析，不绑定任何用户名或开发者路径。
   const profileRoot = path.join(officialDataDir(), "web", "Codex");
   // 官方 Statsig 从此文件读取设备 ID；mini-style-cache 属于另一套身份，不能用于匹配匿名导航评估。
@@ -103,7 +103,8 @@ function desktopFeatureGatesForRenderer(profile, appVersion, locale) {
     if (!gate || typeof gate.value !== "boolean") continue;
     gates[key] = gate.value;
   }
-  return gates;
+  // 导航分流还依赖设备 ID；远端实时评估复用该 ID，避免同账号得到不同布局。
+  return { gates, stableId };
 }
 
 module.exports = {
@@ -111,5 +112,5 @@ module.exports = {
   DESKTOP_PERSISTED_ATOMS_KEY,
   persistedAtomSnapshotForRenderer,
   desktopAccountProfileForRenderer,
-  desktopFeatureGatesForRenderer,
+  desktopNavigationForRenderer,
 };

@@ -1946,6 +1946,8 @@
     }
     const requestId = String(payload.requestId || "");
     if (!requestId) return false;
+    // 实时导航评估必须透传官方服务；再次返回本地默认值会让远端永远停留在旧导航。
+    if (navigationBootstrap && !navigationBootstrap.controller.signal.aborted) return false;
     modificationEffects?.statsig?.emit();
     let request = {};
     try {
@@ -1989,10 +1991,12 @@
     if (typeof fetchOfficial === "function" && cfg.desktopAccountProfile) {
       const controller = new AbortController();
       const timer = scheduler.setTimeout(() => controller.abort(), 30000);
-      const state = { controller, request, profile: cfg.desktopAccountProfile, result: null };
+      // 同账号的远端页面必须复用设备分流 ID；SDK 自身仍保留浏览器的存储身份。
+      const evaluationRequest = { ...request, stable_id: cfg.desktopStatsigStableId || request.stable_id };
+      const state = { controller, request, evaluationRequest, profile: cfg.desktopAccountProfile, result: null };
       navigationBootstrap = state;
       // 继续使用官方认证及 HTTP 服务，不把令牌传给页面，也不读取其他账号的评估。
-      const pending = Promise.resolve().then(() => fetchOfficial(request, controller.signal));
+      const pending = Promise.resolve().then(() => fetchOfficial(evaluationRequest, controller.signal));
       const settled = pending.catch(() => null);
       state.result = settled.finally(() => scheduler.clearTimeout(timer));
     }
@@ -2017,7 +2021,7 @@
           user.userID !== profile.userId || user.customIDs?.account_id !== profile.accountId ||
           user.custom?.auth_method !== "chatgpt" || evaluatedUser?.custom?.auth_method !== "chatgpt" ||
           evaluatedUser?.userID !== user.userID || evaluatedUser.customIDs?.account_id !== profile.accountId ||
-          evaluatedUser.customIDs?.stableID !== user.customIDs?.stableID ||
+          evaluatedUser.customIDs?.stableID !== state.evaluationRequest.stable_id ||
           user.customIDs?.stableID !== state.request.stable_id ||
           evaluatedUser.appVersion !== state.request.app_version || evaluatedUser.locale !== state.request.locale ||
           user.appVersion !== state.request.app_version || user.locale !== state.request.locale) return;
@@ -2048,6 +2052,80 @@
   };
 
   // 新版 renderer 经 AppHost 订阅协同事件；observer 的独立 IPC 推送要接入相同事件分发器。
+  let threadCatalog = null;
+  let threadCoordination = null;
+  const pendingThreadCatalogChanges = new Map();
+
+  /** 将设备端列表变化同步到官方 AppHost 目录，不能只失效 React Query。 */
+  function syncThreadCatalog(payload) {
+    const method = payload?.method;
+    const params = payload?.params;
+    const isRemoval = ["thread-archived", "thread-deleted", "thread/archived", "thread/deleted"].includes(method);
+    const isRestore = method === "thread-unarchived" || method === "thread/unarchived";
+    const isInvalidation = method === "query-cache-invalidate" && params?.queryKey?.[0] === "recent-conversations-meta";
+    if (!isRemoval && !isRestore && !isInvalidation) return;
+    const hostId = params?.hostId || payload.hostId || "local";
+    const threadId = params?.conversationId || params?.threadId;
+    if (!threadCatalog) {
+      // 初始化只保留每个条目的最新变化；正文不进入目录同步队列。
+      pendingThreadCatalogChanges.set(`${hostId}:${threadId || ""}`, payload);
+      if (pendingThreadCatalogChanges.size > 512) pendingThreadCatalogChanges.delete(pendingThreadCatalogChanges.keys().next().value);
+      return;
+    }
+    // 删除/归档事件直接移除官方索引条目；通用通知沿官方源失效与同步接口刷新。
+    const pending = (async () => {
+      if ((isRemoval || isRestore) && typeof threadId === "string") {
+        // 显式删除/恢复按条目提交，避免增量分页遗漏旧条目。
+        await threadCatalog.notifyThread({ hostId, threadId }, isRemoval ? "remove" : "upsert");
+      } else {
+        // 通用失效先更新官方源，再请求当前页面立即刷新。
+        await threadCatalog.invalidateSource(hostId);
+        await threadCatalog.requestSync([hostId], "immediate");
+      }
+    })();
+    pending.catch((error) => console.warn("[codex-web] thread catalog sync failed", error));
+  }
+
+  /** 官方目录服务就绪后消费初始化事件，并原样返回服务供 renderer 使用。 */
+  w.__opencodexInstallThreadCatalog = (service, coordination) => {
+    threadCatalog = service;
+    // 官方 AppHost 的协调服务与目录属于同一个宿主，发送仍使用当前登录会话。
+    threadCoordination = coordination;
+    if (service) {
+      for (const payload of pendingThreadCatalogChanges.values()) {
+        // 将早于 AppHost 就绪的设备事件补交给实际目录。
+        syncThreadCatalog(payload);
+      }
+      pendingThreadCatalogChanges.clear();
+    }
+    return service;
+  };
+
+  /** writer 冲突时发现真实持有者，后续发送与停止沿官方 follower 协议交给该客户端。 */
+  w.__opencodexFindThreadOwner = async (manager, threadId) => {
+    if (!threadCoordination || typeof threadId !== "string" || !threadId) return null;
+    // 只进行持有者发现，不请求接管或重复 thread/resume。
+    return threadCoordination.findThreadOwner({ hostId: manager.getHostId(), conversationId: threadId });
+  };
+
+  /** 只清理官方明确报告 rollout 已不存在的历史条目，网络错误与未落盘新会话保留。 */
+  w.__opencodexRemoveMissingThread = async (manager, threadId, error) => {
+    const message = error?.message;
+    if (!threadCatalog || typeof message !== "string" || message.trim() !== `no rollout found for thread id ${threadId}`) return;
+    const conversation = manager.getConversation(threadId);
+    if (!conversation || conversation.threadRuntimeStatus?.type === "active" ||
+        (conversation.threadStartKind && !conversation.rolloutPath && !conversation.sessionId &&
+         !conversation.title && conversation.turns?.length === 0)) return;
+    try {
+      // 仅移除展示索引，不调用 thread/delete，不改动任何会话文件。
+      await threadCatalog.removeMissingEntry({ hostId: manager.getHostId(), threadId });
+      // 同时驱动当前页的官方删除事件，避免内存摘要把已移除条目重新画回侧栏。
+      manager.handleThreadDeletion([threadId]);
+    } catch (failure) {
+      console.warn("[codex-web] missing thread catalog cleanup failed", failure);
+    }
+  };
+
   let coordinationDispatcher = null;
   let coordinationListenerReady = () => false;
   const pendingCoordinationSnapshots = new Map();
@@ -3995,6 +4073,10 @@
             "server",
             "gateway-ws"
           );
+          if (effectiveChannel === "ipc-broadcast" || effectiveChannel === "mcp-notification") {
+            // 新版侧栏目录独立于旧缓存键，先同步 AppHost 再投递原有 renderer 消息。
+            syncThreadCatalog(rendererMessagePayload);
+          }
           if (shouldDispatchGatewayMessage(msg.channel, effectiveChannel)) {
             dispatch(effectiveChannel, rendererMessagePayload);
           }
@@ -4104,6 +4186,14 @@
   });
 
   // 已连接 socket 保持后台业务语义；只有断线重试暂停，回到前台后再按原退避策略恢复。
+  adapterHost.events.observe({ key: {}, target: w, type: "pagehide", callback: (event) => {
+    // BFCache 暂存仍会恢复原 MessagePort；真正关闭或刷新时才主动释放官方 RPC。
+    if (event.persisted) return;
+    for (const state of [...appHostPortRelays.values()]) {
+      // 正常离开在 WS 关闭前发送 terminal null，临时网络断线仍沿用现有宽限重连。
+      closeAppHostRelay(state, "page_closed", true);
+    }
+  } });
   adapterHost.events.observe({ key: {}, target: document, type: "visibilitychange", callback: handleReconnectVisibilityChange });
   connect();
 })();
